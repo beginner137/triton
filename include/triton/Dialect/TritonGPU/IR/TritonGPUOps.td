@@ -89,6 +89,7 @@ def TTG_AsyncCommitGroupOp : TTG_Op<"async_commit_group"> {
 
 def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
   AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   OptionalTypesMatchWith<"infer mask type from src type",
                  "src", "mask", "getI1SameShape($_self)">,
   OptionalTypesMatchWith<"infer other type from src type",
@@ -368,9 +369,13 @@ def TTG_MemDescReinterpretOp : TTG_Op<"memdesc_reinterpret", [Pure, MemDescViewT
 
   let description = [{
     The `ttg.memdesc_reinterpret` operation reinterprets a memory descriptor
-    as one with a different shape and element type. Because memory descriptors
+    as one with a different shape and element type. For shared-memory
+    descriptors, the logical storage size of the result must not exceed that of
+    the source. Because memory descriptors
     lack strides, this operation is only valid if the original memory descriptor
-    is contiguous.
+    is contiguous. Shared-memory reinterpretation of subviews is not allowed;
+    reinterpret the parent descriptor and then take a subview of the reinterpreted descriptor
+    instead.
   }];
 
   let arguments = (ins TTG_MemDescType:$src);
@@ -382,6 +387,7 @@ def TTG_MemDescReinterpretOp : TTG_Op<"memdesc_reinterpret", [Pure, MemDescViewT
 
   let hasVerifier = 1;
   let hasFolder = 1;
+  let hasVerifier = 1;
 }
 
 def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
@@ -555,6 +561,46 @@ def TTG_LocalScatterOp : TTG_Op<"local_scatter"> {
 
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
   let assemblyFormat = [{$dst `[` $indices `]` `,` $values (`token` $token^)? attr-dict `:` qualified(type($dst)) `,` type($indices) `,` type($values)}];
+  let hasVerifier = 1;
+}
+
+def TTG_LocalAtomicScatterRMWOp : TTG_Op<"local_atomic_scatter_rmw", [
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+  TypesMatchWith<"result type matches values type", "values", "result", "$_self">,
+  OptionalTypesMatchWith<"mask type matches values type",
+                 "values", "mask", "getI1SameShape($_self)">
+]> {
+  let summary = "Atomically scatter RMW elements into shared memory along a specified axis";
+
+  let description = [{
+    Atomically updates elements in a shared memory descriptor using an indices tensor
+    along a single specified axis. The values tensor has the same shape as the
+    indices tensor and the result returns the previous values observed at each
+    updated location.
+
+    For each input position I, the operation atomically updates dst where the
+    coordinate at the axis is replaced by indices[I]:
+      dst[I[0], ..., indices[I], ..., I[n]] =
+        rmw(dst[I[0], ..., indices[I], ..., I[n]], values[I])
+
+    If mask is present, the update is performed only for positions where
+    mask[I] is true. Masked-off positions do not update shared memory and return
+    an undefined old value.
+  }];
+  let arguments = (ins
+    TT_AtomicRMWAttr:$atomic_rmw_op,
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$dst,
+    TT_Tensor:$values,
+    TT_IntTensor:$indices,
+    Optional<I1Tensor>:$mask,
+    I32Attr:$axis
+  );
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $atomic_rmw_op `,` $dst `[` $indices `]` `,` $values (`,` $mask^)? attr-dict `:`
+    functional-type(operands, results)
+  }];
   let hasVerifier = 1;
 }
 

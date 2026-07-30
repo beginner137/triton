@@ -4,6 +4,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/LayoutUtils.h"
 #include <numeric>
 #include <optional>
 
@@ -12,6 +13,14 @@
 
 namespace mlir::LLVM::AMD {
 namespace {
+
+Value vecGet(TritonLLVMOpBuilder &b, Value vec, int idx) {
+  return b.extract_element(vec, b.i32_val(idx));
+}
+
+Value vecSet(TritonLLVMOpBuilder &b, Value vec, int idx, Value val) {
+  return b.insert_element(vec, val, b.i32_val(idx));
+}
 
 // Helper to decode a value spanning two 32-bit words
 static Value decode48BitValue(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
@@ -126,10 +135,140 @@ SmallVector<Value> TDMDescriptor::getAllGroups() const {
   return result;
 }
 
+SmallVector<Value> unpackTDMDescriptor(RewriterBase &rewriter, Location loc,
+                                       Value descStruct) {
+  auto scalars = unpackLLElements(loc, descStruct, rewriter);
+  assert((scalars.size() == 12 || scalars.size() == 20) &&
+         "TDM descriptor must be 12 (2D) or 20 (3D-5D) i32 scalars");
+  SmallVector<Value> groups;
+  groups.push_back(packLLVector(
+      loc, SmallVector<Value>(scalars.begin(), scalars.begin() + 4), rewriter));
+  groups.push_back(packLLVector(
+      loc, SmallVector<Value>(scalars.begin() + 4, scalars.begin() + 12),
+      rewriter));
+  if (scalars.size() == 20) {
+    groups.push_back(packLLVector(
+        loc, SmallVector<Value>(scalars.begin() + 12, scalars.begin() + 16),
+        rewriter));
+    groups.push_back(packLLVector(
+        loc, SmallVector<Value>(scalars.begin() + 16, scalars.begin() + 20),
+        rewriter));
+  }
+  return groups;
+}
+
+SmallVector<Value> scalarizeTDMDescriptor(RewriterBase &rewriter, Location loc,
+                                          ArrayRef<Value> vectors) {
+  assert((vectors.size() == 2 || vectors.size() == 4) &&
+         "TDM descriptor must be 2 (2D) or 4 (3D-5D) vector groups");
+  SmallVector<Value> scalars;
+  for (Value vec : vectors) {
+    auto unpacked = unpackLLVector(loc, vec, rewriter);
+    scalars.append(unpacked.begin(), unpacked.end());
+  }
+  return scalars;
+}
+
 // Swap the trailing two dimensions of a vector for TDM operations.
 template <typename T> void swapTrailingDims(SmallVector<T> &vec) {
   assert(vec.size() >= 2 && "need at least 2 dims to swap");
   std::swap(vec[vec.size() - 2], vec[vec.size() - 1]);
+}
+
+void updateTensorDescriptor(RewriterBase &rewriter, Location loc,
+                            Type elementType, ArrayRef<int64_t> blockShape,
+                            Value &group0, Value &group1,
+                            ArrayRef<Value> addOffsets,
+                            ArrayRef<Value> setBounds, Value dest, Value pred,
+                            Value barrier) {
+  size_t numDims = blockShape.size();
+  assert(numDims == 2 && "updateTensorDescriptor currently supports 2D");
+
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value v16 = b.i32_val(16);
+
+  // ---- add_offsets: bump global_addr ----
+  if (!addOffsets.empty()) {
+    auto elementBitWidth = elementType.getIntOrFloatBitWidth();
+    Value elemSize = b.i64_val(elementBitWidth / 8);
+
+    // Decode current 48-bit global_addr from group0[2:3] (valid bit masked).
+    Value addrLo = vecGet(b, group0, 2);
+    Value addrHi = b.and_(vecGet(b, group0, 3), b.i32_val(0x7FFFFFFF));
+    Value addr = b.or_(b.zext(i64_ty, addrLo),
+                       b.shl(b.zext(i64_ty, addrHi), b.i64_val(32)));
+
+    // Byte delta:
+    //   addOffsets[1] (innermost, stride 1) +
+    //   addOffsets[0] * tensor_dim0_stride (from group1[5]),
+    // all scaled by element size.  Promote to i64 before the multiply so
+    // addOffsets[0] * stride0 doesn't overflow i32 for large tensors.
+    // Offsets are signed (advancing backward is allowed) so sext; stride is
+    // unsigned so zext.
+    Value stride0 = vecGet(b, group1, 5);
+    Value off0_64 = b.sext(i64_ty, addOffsets[0]);
+    Value off1_64 = b.sext(i64_ty, addOffsets[1]);
+    Value stride0_64 = b.zext(i64_ty, stride0);
+    Value deltaElem = b.add(off1_64, b.mul(off0_64, stride0_64));
+    Value byteDelta = b.mul(deltaElem, elemSize);
+    addr = b.add(addr, byteDelta);
+
+    // Re-pack, restoring the valid bit in group0[3] bit 31.
+    Value newLo = b.trunc(i32_ty, addr);
+    Value newHi = b.trunc(i32_ty, b.lshr(addr, b.i64_val(32)));
+    newHi = b.or_(newHi, b.i32_val(1 << 31));
+    group0 = vecSet(b, group0, 2, newLo);
+    group0 = vecSet(b, group0, 3, newHi);
+  }
+
+  // ---- set_bounds: absolute rewrite of tensor_dim ----
+  // tensor_dim_inner (setBounds[1] for 2D) spans
+  //   group1[1] hi-16 | group1[2] lo-16
+  // tensor_dim_outer (setBounds[0]) spans
+  //   group1[2] hi-16 | group1[3] lo-16
+  if (!setBounds.empty()) {
+    auto stampDim = [&](int loDword, int hiDword, Value newDim) {
+      // loDword: keep lo-16, replace hi-16 with (newDim & 0xFFFF) << 16
+      Value loHi = b.shl(b.and_(newDim, b.i32_val(0xFFFF)), v16);
+      Value g_lo = b.or_(
+          b.and_(vecGet(b, group1, loDword), b.i32_val(0x0000FFFF)), loHi);
+      group1 = vecSet(b, group1, loDword, g_lo);
+      // hiDword: keep hi-16, replace lo-16 with (newDim >> 16) & 0xFFFF
+      Value hiLo = b.and_(b.lshr(newDim, v16), b.i32_val(0xFFFF));
+      Value g_hi = b.or_(
+          b.and_(vecGet(b, group1, hiDword), b.i32_val(0xFFFF0000)), hiLo);
+      group1 = vecSet(b, group1, hiDword, g_hi);
+    };
+    stampDim(/*loDword=*/1, /*hiDword=*/2, setBounds[1]); // inner
+    stampDim(/*loDword=*/2, /*hiDword=*/3, setBounds[0]); // outer
+  }
+
+  // ---- dest: rewrite lds_addr in group0[1] ----
+  if (dest) {
+    Value ldsAddr = b.ptrtoint(i32_ty, dest);
+    group0 = vecSet(b, group0, 1, ldsAddr);
+  }
+
+  // ---- pred: rewrite group0[0] ----
+  if (pred) {
+    // Note: this clobbers any mode bits stored in group0[0] (gather/scatter
+    // mode bit in bit 31, index-size bit in bit 30).  TODO: Gather/scatter
+    // mutation is not yet supported here; a future revision should preserve
+    // them.
+    group0 = vecSet(b, group0, 0, pred);
+  }
+
+  // ---- barrier: enable bit (group1[0] bit 18) + addr (group1[1] lo-16) ----
+  if (barrier) {
+    Value g1_0 = vecGet(b, group1, 0);
+    Value g1_1 = vecGet(b, group1, 1);
+    g1_0 = b.or_(g1_0, b.shl(b.i32_val(1), b.i32_val(18)));
+    g1_1 = b.or_(b.and_(g1_1, b.i32_val(0xFFFF0000)),
+                 b.and_(b.lshr(b.ptrtoint(i32_ty, barrier), b.i32_val(3)),
+                        b.i32_val(0x0000FFFF)));
+    group1 = vecSet(b, group1, 0, g1_0);
+    group1 = vecSet(b, group1, 1, g1_1);
+  }
 }
 
 // Decode a full TDM descriptor from all 4 group vectors for 3D-5D tensors
@@ -239,7 +378,6 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   assert(blockShape.size() == tensorStride.size() &&
          blockShape.size() == numDims &&
          "Block/tensor/stride dim count must all be equal.");
-  auto ctx = rewriter.getContext();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   if (!isRowMajor) {
@@ -251,8 +389,6 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   // Define common values for better readability
   Value v16 = b.i32_val(16);
   Value v32 = b.i64_val(32);
-  Value mask16 = b.i32_val(0xFFFF);
-  Value mask31 = b.i32_val(0x7FFFFFFF);
 
   auto elementBitWidth = elementType.getIntOrFloatBitWidth();
   auto elementSizeInBytes = elementBitWidth / 8;
@@ -339,14 +475,18 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   SmallVector<Value> group1(8, b.i32_val(0));
   int32_t dataSize = log2(elementSizeInBytes);
   unsigned dwordSize = 32;
-  auto padIntervalInDwords = padInterval * elementBitWidth / dwordSize;
+  auto padIntervalBits = padInterval * elementBitWidth;
+  assert(padIntervalBits % dwordSize == 0 &&
+         "padInterval must be a multiple of dwordSize(32bit)");
+  auto padIntervalInDwords = padIntervalBits / dwordSize;
   auto padAmountInDwords = padAmount * elementBitWidth / dwordSize;
   group1[0] = b.or_(group1[0], b.i32_val(dataSize << 16));
   if (padIntervalInDwords > 0 && padAmountInDwords > 0) {
     assert(llvm::isPowerOf2_32(padIntervalInDwords));
-    int32_t log2PadInterval = log2(padIntervalInDwords);
+    int32_t log2PadIntervalDwords = log2(padIntervalInDwords);
+    assert(log2PadIntervalDwords <= 8 && "padInterval too large");
     group1[0] = b.or_(group1[0], b.i32_val(1 << 20));
-    group1[0] = b.or_(group1[0], b.i32_val((log2PadInterval - 1) << 22));
+    group1[0] = b.or_(group1[0], b.i32_val((log2PadIntervalDwords - 1) << 22));
     group1[0] = b.or_(group1[0], b.i32_val((padAmountInDwords - 1) << 25));
   }
   // Encode 32-bit tensor shapes
@@ -660,8 +800,17 @@ void fillTDMDescriptor(
   dstPtr = b.gep(sharedPtrTy, elementType, dstPtr, dstOffset);
 
   // Update tensor shapes based on offset
+  Value zero = b.i32_val(0);
   for (size_t i = 0; i < numDims; ++i) {
-    tensorShape[i] = b.smax(b.i32_val(0), b.sub(tensorShape[i], offset[i]));
+    // Clamp in this specific way to avoid suboptimal codegen by LLVM.
+    // In some cases, LLVM InstCombine match and fold patterns into instructions
+    // that only have VALU target instructions. Thus extra v_readfirstlane_b32
+    // instructions are emitted to copy the value to sgpr after VALU
+    // instructions.
+    Value diff = b.sub(tensorShape[i], offset[i]);
+    Value clamped = b.smax(diff, zero);
+    Value isNeg = b.icmp_slt(offset[i], zero);
+    tensorShape[i] = b.select(isNeg, zero, clamped);
   }
 
   // TDM store does not support padding in general. However, if the padding
@@ -764,7 +913,7 @@ void fillTDMDescriptorForGatherScatter(
     SmallVector<Value> &group2, SmallVector<Value> &group3, Value ldsRowOffset,
     Value globalColOffset, Value ldsPtr, Value pred, Value barrierPtr,
     const triton::LinearLayout &cgaLayout, Value ctaId,
-    ArrayRef<Value> rowIndices, bool use32BitIndices) {
+    ArrayRef<Value> rowIndices, bool use32BitIndices, bool isGather) {
   assert(!rowIndices.empty() && "Gather/scatter requires row indices.");
 
   auto ctx = rewriter.getContext();
@@ -805,7 +954,29 @@ void fillTDMDescriptorForGatherScatter(
 
   // Adjust column tensor shape for OOB handling - subtract column offset to
   // get remaining elements.
-  tensorShape[1] = b.smax(b.i32_val(0), b.sub(tensorShape[1], globalColOffset));
+  {
+    // Clamp in this specific way to avoid suboptimal codegen by LLVM.
+    // In some cases, LLVM InstCombine match and fold patterns into instructions
+    // that only have VALU target instructions. Thus extra v_readfirstlane_b32
+    // instructions are emitted to copy the value to sgpr after VALU
+    // instructions.
+    Value zero = b.i32_val(0);
+    Value diff = b.sub(tensorShape[1], globalColOffset);
+    Value clamped = b.smax(diff, zero);
+    Value isNeg = b.icmp_slt(globalColOffset, zero);
+    tensorShape[1] = b.select(isNeg, zero, clamped);
+  }
+
+  // For scatter with padding (store-from-LDS): clamp tensor_dim0 to the
+  // original column width so OOB checking drops padding elements before they
+  // reach global memory.  We do this before encoding group1 so the clamped
+  // value flows through naturally (matching the fillTDMDescriptor pattern).
+  // tile_dim0 widening is handled later in the tile_dim0 fixup block.
+  if (!isGather && padInterval > 0 && padAmount > 0) {
+    Value originalColWidth = b.i32_val(blockShape.back());
+    Value cmp = b.icmp_ult(tensorShape[1], originalColWidth);
+    tensorShape[1] = b.select(cmp, tensorShape[1], originalColWidth);
+  }
 
   // Update group0 with addresses and enable gather/scatter mode
   Value globalAddr = b.ptrtoint(i64_ty, globalPtr);
@@ -848,6 +1019,21 @@ void fillTDMDescriptorForGatherScatter(
   size_t numIndices = rowIndices.size();
   group1[4] = b.and_(group1[4], b.i32_val(0xFFFF0000));
   group1[4] = b.or_(group1[4], b.i32_val(numIndices & 0xFFFF));
+
+  // Fix tile_dim0 for gather/scatter: createTDMDescriptor divides the column
+  // dimension across warps for regular load/store, but gather and scatter use
+  // row indices and need the full undivided column width.
+  if (blockShape.size() >= 2) {
+    int64_t tileDim0 = blockShape.back();
+
+    // For scatter with padding: widen tile_dim0 to include padding so the
+    // hardware's LDS read stride matches the padded row width.
+    if (!isGather && padInterval > 0 && padAmount > 0)
+      tileDim0 += padAmount;
+
+    group1[3] = b.and_(group1[3], b.i32_val(0xFFFF));
+    group1[3] = b.or_(group1[3], b.i32_val(tileDim0 << 16));
+  }
 
   // Fill group2 and group3 with row indices
   if (use32BitIndices) {
@@ -923,16 +1109,15 @@ static int64_t computePerPartitionSliceStride(
 
 // Emit a single TDM intrinsic (load or store) for the given block shape.
 // This handles both the 2D (d2 intrinsic) and >2D (full intrinsic) cases.
-static void
-emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
-                 const LLVMTypeConverter *typeConverter, ArrayRef<Value> desc,
-                 size_t numDims, Type elementType,
-                 SmallVector<int64_t> effectiveBlockShape, int numWarps,
-                 unsigned padInterval, unsigned padAmount,
-                 SmallVector<Value> globalOffset, ArrayRef<Value> instrDstPtrs,
-                 Value pred, Value multicastMask, Value barrier,
-                 const triton::LinearLayout &instrSharedLayout, Value ctaId,
-                 bool isLoad, bool isRowMajor, ArrayRef<unsigned> warpsPerCTA) {
+static void emitTDMIntrinsic(
+    RewriterBase &rewriter, Location loc,
+    const LLVMTypeConverter *typeConverter, ArrayRef<Value> desc,
+    size_t numDims, Type elementType, SmallVector<int64_t> effectiveBlockShape,
+    int numWarps, unsigned padInterval, unsigned padAmount,
+    SmallVector<Value> globalOffset, ArrayRef<Value> instrDstPtrs, Value pred,
+    Value multicastMask, Value barrier,
+    const triton::LinearLayout &instrSharedLayout, Value ctaId, bool isLoad,
+    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA, int32_t auxBits) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
   Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
@@ -959,7 +1144,7 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
                                        : "llvm.amdgcn.tensor.store.from.lds";
     LLVM::createLLVMIntrinsicCallOp(
         rewriter, loc, intrinsicName, {},
-        {group0, group1, group2, group3, group4Zero, b.i32_val(0)});
+        {group0, group1, group2, group3, group4Zero, b.i32_val(auxBits)});
   } else {
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.end());
@@ -978,9 +1163,9 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
 
     const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds"
                                        : "llvm.amdgcn.tensor.store.from.lds";
-    LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, intrinsicName, {},
-        {group0, group1, group2Zero, group3Zero, group4Zero, b.i32_val(0)});
+    LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsicName, {},
+                                    {group0, group1, group2Zero, group3Zero,
+                                     group4Zero, b.i32_val(auxBits)});
   }
 }
 
@@ -1000,7 +1185,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       Value pred, Value multicastMask, Type elementType,
                       Value barrierPtr, bool isLoad,
                       const triton::LinearLayout &sharedLayout,
-                      Attribute encoding, Value ctaId, bool isRowMajor) {
+                      Attribute encoding, Value ctaId, bool isRowMajor,
+                      int32_t auxBits) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   size_t numDims = blockShape.size();
   assert(numDims <= 5);
@@ -1017,7 +1203,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                      to_vector(blockShape), numWarps, padInterval, padAmount,
                      to_vector(offset), dstPtrs, pred, multicastMask,
                      barrierPtr, sharedLayout, ctaId, isLoad, isRowMajor,
-                     warpsPerCTA);
+                     warpsPerCTA, auxBits);
     return;
   }
 
@@ -1081,7 +1267,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
     emitTDMIntrinsic(rewriter, loc, typeConverter, desc, numDims, elementType,
                      effectiveBlockShape, numWarps, padInterval, padAmount,
                      globalOffset, instrDstPtrs, pred, multicastMask, barrier,
-                     sliceLayout, ctaId, isLoad, isRowMajor, warpsPerCTA);
+                     sliceLayout, ctaId, isLoad, isRowMajor, warpsPerCTA,
+                     auxBits);
   }
 }
 
@@ -1105,18 +1292,83 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
                           Value barrierPtr,
                           const triton::LinearLayout &cgaLayout, Value ctaId,
                           ArrayRef<Value> rowIndices, Value colOffset,
-                          bool use32BitIndices, bool isGather) {
+                          bool isGather, int numWarps,
+                          RankedTensorType indicesType) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   assert(!rowIndices.empty() && "Gather/scatter requires row indices");
   assert(colOffset && "Gather/scatter requires column offset");
 
-  size_t numIndices = rowIndices.size();
+  bool use32BitIndices =
+      indicesType.getElementType().getIntOrFloatBitWidth() == 32;
   size_t maxIndicesPerInstr = use32BitIndices ? 8 : 16;
 
-  // Calculate the number of TDM instructions we'll emit
-  size_t numInstructions =
-      getTDMGatherScatterInstrinsicCount(numIndices, use32BitIndices);
+  // Use LinearLayout to determine:
+  // 1. Which registers are broadcasted — remove duplicates
+  // 2. Which warps are redundant — zero the pred to make instruction a no-op
+  // 3. Per-batch LDS row offset — via applyLinearLayout per batch
+  // This analysis is direction-agnostic: the index layout determines which warp
+  // owns which rows in LDS, regardless of whether data flows to LDS (gather) or
+  // from LDS (scatter).
+  auto indexLL = triton::gpu::toLinearLayout(indicesType);
+  assert(indexLL.getNumOutDims() == 1 &&
+         "Gather/scatter index layout must have exactly one output dimension");
+  auto freeVarMasks = indexLL.getFreeVariableMasks();
+
+  auto kRegister = rewriter.getStringAttr("register");
+  auto kLane = rewriter.getStringAttr("lane");
+  auto kWarp = rewriter.getStringAttr("warp");
+
+  // Remove broadcasted (duplicated) register entries. After this, indexLL
+  // has a compact register dimension and effectiveRowIndices contains only
+  // unique index values.
+  SmallVector<Value> effectiveRowIndices(rowIndices.begin(), rowIndices.end());
+  auto removeBcast = actionRemoveBroadcastedRegs(indexLL);
+  if (!removeBcast.isIdentity()) {
+    indexLL = removeBcast.apply(indexLL);
+    effectiveRowIndices = removeBcast.apply(
+        SmallVector<Value>(rowIndices.begin(), rowIndices.end()));
+  }
+
+  Value warpId = getLaneAndWarpId(rewriter, loc).second;
+
+  // If any warp bits are free, those warps hold redundant copies.
+  // Zero the pred so the instruction becomes a no-op.
+  int32_t warpFreeMask = freeVarMasks.lookup(kWarp);
+  if (warpFreeMask != 0) {
+    Value isActive =
+        b.icmp_eq(b.and_(warpId, b.i32_val(warpFreeMask)), b.i32_val(0));
+    pred = b.select(isActive, pred, b.i32_val(0));
+  }
+
+  // The index encoding may cover fewer warps than the CTA actually has.
+  // applyLinearLayout wraps extra warp IDs via modular arithmetic,
+  // causing silent duplication. Predicate off explicitly.
+  int numLayoutWarps = indexLL.getInDimSize(kWarp);
+  if (numLayoutWarps < numWarps) {
+    Value inRange = b.icmp_ult(warpId, b.i32_val(numLayoutWarps));
+    pred = b.select(inRange, pred, b.i32_val(0));
+  }
+
+  size_t contigIndiceCount = indexLL.getNumConsecutiveInOut();
+  maxIndicesPerInstr = std::min(maxIndicesPerInstr, contigIndiceCount);
+
+  // Precompute LDS row offset for each instruction batch via
+  // applyLinearLayout with the actual register index and warp ID.
+  SmallVector<Value> batchLdsOffsets;
+  auto kBlock = rewriter.getStringAttr("block");
+  for (size_t startIdx = 0; startIdx < effectiveRowIndices.size();
+       startIdx += maxIndicesPerInstr) {
+    auto offsets = applyLinearLayout(loc, rewriter, indexLL,
+                                     {{kRegister, b.i32_val(startIdx)},
+                                      {kLane, b.i32_val(0)},
+                                      {kWarp, warpId},
+                                      {kBlock, b.i32_val(0)}});
+    batchLdsOffsets.push_back(offsets[0].second);
+  }
+
+  size_t numIndicesPerWarp = effectiveRowIndices.size();
+  size_t numInstructions = batchLdsOffsets.size();
 
   // Get the descriptor groups (gather/scatter uses 2D format: 12 dwords)
   auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
@@ -1129,11 +1381,11 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
   // Issue multiple TDM instructions if needed
   for (size_t instrIdx = 0; instrIdx < numInstructions; ++instrIdx) {
     size_t startIdx = instrIdx * maxIndicesPerInstr;
-    size_t endIdx = std::min(startIdx + maxIndicesPerInstr, numIndices);
+    size_t endIdx = std::min(startIdx + maxIndicesPerInstr, numIndicesPerWarp);
 
     // Get the subset of indices for this batch
-    SmallVector<Value> batchIndices(rowIndices.begin() + startIdx,
-                                    rowIndices.begin() + endIdx);
+    SmallVector<Value> batchIndices(effectiveRowIndices.begin() + startIdx,
+                                    effectiveRowIndices.begin() + endIdx);
 
     // Make copies of the descriptor groups for this iteration
     auto g0 = group0Vec;
@@ -1141,14 +1393,13 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
     auto g2 = group2Vec;
     auto g3 = group3Vec;
 
-    // Fill the descriptor for gather/scatter:
-    // - ldsRowOffset: row offset within shared memory for this batch
-    // - colOffset: starting column in global memory
+    Value ldsRowOffset = batchLdsOffsets[instrIdx];
+
     fillTDMDescriptorForGatherScatter(
         rewriter, loc, typeConverter, elementType, to_vector(blockShape),
-        padInterval, padAmount, g0, g1, g2, g3, b.i32_val(startIdx), colOffset,
-        ldsPtr, pred, barrierPtr, cgaLayout, ctaId, batchIndices,
-        use32BitIndices);
+        padInterval, padAmount, g0, g1, g2, g3, ldsRowOffset, colOffset, ldsPtr,
+        pred, barrierPtr, cgaLayout, ctaId, batchIndices, use32BitIndices,
+        isGather);
 
     // Pack and emit the instruction
     auto group0 = packLLVector(loc, g0, rewriter);

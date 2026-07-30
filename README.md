@@ -15,6 +15,48 @@ Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:
 While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.
 
 
+## Nightly builds (fbtriton)
+
+Nightly `.dev` wheels are published to a self-managed index (not PyPI):
+
+    pip install --pre fbtriton \
+      --index-url https://facebookexperimental.github.io/triton/nightly/simple/
+
+Each nightly is built from the newest `main` commit whose GPU/CI checks are all
+green. `triton.__version__` reports `3.8.0.dev<YYYYMMDD>+fb.git<hash>`. Nightlies
+are retained for ~30 days. Formal releases remain on PyPI (`pip install fbtriton`).
+
+
+## Gluon support
+
+[Gluon](https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon)
+(`python/triton/experimental/gluon/`) is **upstream-synced and not a first-class DSL** here
+(TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton
+is a secondary Triton, we run **fundamental Gluon CI** so we don't silently break it.
+
+**CI:** the `b200-gluon-test` / `mi350-gluon-test` jobs run `pytest python/test/gluon/` (every
+`test_*.py`). It is **green**: ~200 passed, ~1600 skipped, 0 failed. The real signal is the
+compile-only, target-agnostic frontend suite (`test_frontend.py`, one run covers NVIDIA + AMD
+codegen via mock `GPUTarget`); the version-skewed cases below are skipped via
+`python/test/gluon/conftest.py` rather than failing the job.
+
+**Fork-side fixes** (Gluon frontend itself unmodified): `core.py` reduce `reduction_ordering`
+compat, `semantic.py` `dot()` `allow_tf32` default, a `test_core.py` collection fix (a bad
+cherry-pick left an `IndentationError`), and regenerated `test_frontend.py` goldens
+(upstream-synced — overwritten on next sync).
+
+**Skipped, needs upstream Gluon re-sync — TODO(gluon-ci):** the GPU-execution suites
+(`test_core`, `test_lowerings`, `test_consan`, `test_fpsan`, one kernel in
+`test_layout_format_view`) were synced from much newer upstream (e.g. `test_fpsan.py` via bundle
+#1956) than the pinned Gluon frontend (`_semantic.py` ~2026-06-29). They require Gluon behavior
+the frontend doesn't have yet — raw pointer `gl.load`/`gl.store` inferring a *distributed* layout
+— so they fail wholesale with `expected ... distributed_type but got block_type`. The fix is to
+sync the Gluon frontend forward (upstream cherry-pick / re-sync), not a local patch. Also skipped:
+~9 frontend per-target golden tests (single inline golden can't match every parametrized target)
+and the `create_lds_barrier_wait` pybind mismatch. `conftest.py` lists these; remove/trim it after
+the re-sync.
+
+
 ## The DSL Extension
 
 > **Hardware availability tags.** Each op below is tagged with the targets it runs on:
@@ -733,7 +775,7 @@ Examples: how mbarriers are communicated in warp specialization
 - `tlx.async_tasks` and `tlx.async_task` **[Hopper+]**
 
 ```
-    with tlx.async_tasks
+    with tlx.async_tasks()
         with tlx.async_task("default")
             ...
         with tlx.async_task(num_warps=4)
@@ -744,6 +786,14 @@ Examples: how mbarriers are communicated in warp specialization
 `tlx.async_task("default")` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.
+
+#### async_tasks Parameters
+
+| Parameter                | Description                                                                                                                                                                                      |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
+| `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
+| `mbarrier_try_wait_suspend_ns` | On Blackwell, use the four-operand `mbarrier.try_wait.parity` form with this suspend hint for waits in the kernel. `None` is unspecified, `0` explicitly disables the hint, and positive values enable it. If multiple `async_tasks` regions specify a value, the minimum explicit value is used module-wide. Default to None. |
 
 #### async_task Parameters
 
@@ -944,6 +994,104 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
   tlx.prefetch(desc_in, tensormap=True)
   ```
 
+- `tlx.dump_layout(x)` **[Hopper+, MI300+]**
+
+    Compile-time diagnostic that prints the resolved layout of a value to the
+    compiler log. `x` may be a register tensor or a shared/tensor-memory buffer
+    (memdesc). It emits **no** device code and returns nothing — this is a
+    static, host-side diagnostic, distinct from the runtime `tl.device_print` /
+    `tl.print`. The op is rendered at the end of the TTGIR pipeline, so the
+    printed layout reflects all compiler optimizations, then it is erased.
+
+    The layout is printed in CuTe (CUTLASS) `Shape:Stride` notation (`_N` marks
+    a static integer):
+    - Register tensors → a thread-value (TV) layout
+      `((thread...),(value...)):((thread...),(value...))`, where the thread
+      group comes from the hardware lane/warp/block dims and the value group
+      from the per-thread registers (stride `_0` denotes a broadcast).
+    - Shared/tensor-memory buffers → a single strided layout, e.g. `_64:_1`.
+    - Swizzled shared buffers → `Swizzle<B,M,S> o (base):(stride)`.
+
+    In all cases the layout maps a coordinate to the **logical tensor's
+    row-major element index** (its codomain): for a register tensor a
+    `(thread, value)` coordinate → the logical element index it holds, and for
+    a buffer an offset → the buffer element index. The strides are offsets in
+    that logical index space, not physical byte/bank addresses.
+
+    Layouts that are not representable as a CuTe layout fall back to the raw
+    linear-layout string.
+
+    Example:
+    ```python
+    x = tl.load(x_ptr + offs)          # register tensor
+    tlx.dump_layout(x)                  # -> // cute: ((_32,_2,_2),_1):((_1,_32,_0),_0)
+
+    buf = tlx.local_alloc((BLOCK,), tl.float32, 1)
+    v = tlx.local_view(buf, 0)
+    tlx.dump_layout(v)                  # -> // cute: _64:_1
+    ```
+
+- `x = tlx.require_layout(x, layout, pin=True)` **[Hopper+, MI300+]**
+
+    Require a register tensor `x` to use `layout`, expressed as a
+    `tlx.layout(...)` (Shape:Stride). With the default `pin=True`, the `#linear`
+    encoding is wrapped as `#tlx.no_verify_layout(#tlx.user_layout(...))`. The
+    inner `#tlx.user_layout` carries `PinnedEncodingTrait`, so downstream passes
+    (`tritongpu-coalesce`, `remove-layout-conversions`, AMD `optimize-epilogue`)
+    treat it as fixed and never rewrite it; the outer `#tlx.no_verify_layout` defers
+    operand-layout verification until the pin is peeled by
+    `TLXResolvePlaceholderLayouts` in `make_ttgir`. Example: pin an FP16 epilogue
+    `tl.store` to a coalesced layout so `OptimizeEpilogue` keeps the wide
+    `buffer_store_dwordx4` instead of narrowing it to the MMA-accumulator store,
+    without staging the value through LDS.
+
+    Pass `pin=False` for an optimizer-flexible requirement. This emits the
+    requested encoding without the `#tlx.user_layout` hard anchor, allowing
+    later layout passes to propagate the requirement or materialize a layout
+    conversion. The default remains `pin=True` for existing callers.
+
+    Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
+    pin survived to the final TTGIR.
+
+- `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
+
+    Compile-time assertion that two layouts are equivalent after layout
+    propagation and all other TTGIR layout optimizations have completed. Like
+    `tlx.dump_layout`, it emits no device code and is consumed at the end of the
+    TTGIR pipeline.
+
+    `rhs` supports two forms:
+
+    - **Value/value:** `rhs` is another register tensor or shared/tensor-memory
+      buffer. The frontend emits `tlx.assert_same_layout`, whose two operands
+      retain their independently resolved final types.
+    - **Value/layout:** `rhs` is a constant `tlx.layout_encoding`. The frontend
+      lowers the constant to an encoding attribute and emits
+      `tlx.assert_same_layout_expected`. At assertion time, the pass combines
+      that encoding with `lhs`'s shape, element type, and (for buffers) memory
+      properties to construct an expected tensor or memdesc type.
+
+    These are separate internal operations only because an SSA value is an MLIR
+    operand while a constant layout is an MLIR attribute. They share the same
+    comparison path and the same public Python API.
+
+    Before comparison, both final types are converted with
+    `ttg::toLinearLayout`. The assertion compares the resulting
+    `LinearLayout`s, not the original encoding attributes. Consequently,
+    structurally different encodings pass if they describe the same logical
+    mapping. A mismatch reports both normalized LinearLayouts and fails
+    compilation.
+
+    Example:
+
+    ```python
+    x = tlx.local_load(x_buf, layout=REGISTER_LAYOUT)
+    y = tlx.local_load(y_buf, layout=REGISTER_LAYOUT)
+
+    tlx.assert_same_layout(x, y)                # value/value
+    tlx.assert_same_layout(x, REGISTER_LAYOUT)  # value/layout
+    ```
+
 
 ## Buffer Operations (AMD)
 
@@ -1011,6 +1159,11 @@ token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cach
 **Returns**: A `tlx.async_token` that can be used with `tlx.async_load_wait_group()` to synchronize on the completion of the transfer.
 
 Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
+
+**Requirements.** The direct-to-LDS copy has the following hardware constraints:
+- **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
+- **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
+- **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
 
 ### Example
 

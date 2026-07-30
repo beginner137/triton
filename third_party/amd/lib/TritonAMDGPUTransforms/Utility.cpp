@@ -3,6 +3,8 @@
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Tools/LayoutUtils.h"
 
 #include <limits>
@@ -144,7 +146,7 @@ int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
 // pad,  r1, r5,  r9, r13, r17, r21, r25
 // r29, pad, r2,  r6, r10, r14, r18, r22
 // r26, r30, pad, r3 ....
-static ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
+ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     ttg::DotOperandEncodingAttr dotOpEnc, ttg::TensorOrMemDesc srcTy,
     ArrayRef<unsigned> sharedOrder, bool useAsyncCopy, unsigned warpSize) {
   auto *ctx = srcTy.getContext();
@@ -418,8 +420,9 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
     // 2× ensures the stride (in dwords) is an odd multiple of the combined
     // row-access width, distributing all 16 lanes' bank accesses across
     // disjoint banks and eliminating conflicts for tile widths >= 32.
-    if (auto ldsParams = targetInfo.queryLDSTransLoadParams(typeWidthInBit)) {
-      padAmount = 2 * ldsParams->instBitWidth / typeWidthInBit;
+    auto ldsParamsVec = targetInfo.queryLDSTransLoadParams(typeWidthInBit);
+    if (!ldsParamsVec.empty()) {
+      padAmount = 2 * ldsParamsVec[0].instBitWidth / typeWidthInBit;
     }
   } else {
     // Non-transposed path: each cycle 16 lanes at distinct nonK rows load
@@ -455,6 +458,13 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
   unsigned bankWrapInterval = ldsNumBanks * ldsBankWidthInBytes / elemBytes;
   unsigned padInterval =
       std::max(static_cast<unsigned>(innerDimLength), bankWrapInterval);
+
+  // TDM only supports a maximum pad interval of 256 * 32bit.
+  // TODO: this will produce conflicts for very large INNER_DIMS (>1024bytes),
+  // we could scale the pad amount if this becomes an issue.
+  unsigned maxPadIntervalElems = 256u * 32u / typeWidthInBit;
+  padInterval = std::min(padInterval, maxPadIntervalElems);
+
   auto *context = srcTy.getContext();
   return triton::gpu::PaddedSharedEncodingAttr::get(
       context, {{padInterval, padAmount}}, order, shape, CGALayout);
@@ -480,6 +490,19 @@ composePaddedLayout(const tt::AMD::TargetInfo &targetInfo, int opIdx,
   }
 
   return {};
+}
+
+ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,
+                                                   RankedTensorType tensorType,
+                                                   Value desc) {
+  auto descTy = cast<tt::TensorDescType>(desc.getType());
+  auto sharedLayout = descTy.getSharedLayout();
+  if (!sharedLayout) {
+    emitError(op->getLoc()) << "Missing encoding on the tensor descriptor";
+    return {};
+  }
+  auto encoding = cast<ttg::SharedEncodingTrait>(sharedLayout);
+  return ttg::updateEncodingForShape(op, encoding, tensorType);
 }
 
 Attribute buildDefaultTDMDescriptorEncoding(MLIRContext *ctx,

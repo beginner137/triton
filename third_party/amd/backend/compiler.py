@@ -25,15 +25,40 @@ def is_pingpong_schedule_enabled(arch, use_async_copy):
 
 
 def is_in_thread_transpose_enabled(arch):
-    return ((arch == "gfx942") if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose)
+    return (arch == "gfx942" or "gfx110" in arch or "gfx115" in arch or "gfx120" in arch) \
+        if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose
 
 
 def is_async_copy_enabled(arch):
     return ((arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy)
 
 
+def is_expert_sched_supported(arch):
+    return arch in ["gfx1250"]
+
+
 def is_fpsan_supported(arch):
     return arch in ["gfx942", "gfx950", "gfx1250"]
+
+
+def is_consan_supported(arch):
+    return arch in ["gfx1250"]
+
+
+def disable_real_true16_feature(arch):
+    return '-real-true16' if arch.startswith('gfx11') else ''
+
+
+def _parse_llvm_fn_attrs(attrs):
+    if not isinstance(attrs, str):
+        return tuple(attrs)
+    parsed = []
+    for attr in attrs.split(","):
+        name, sep, value = attr.partition("=")
+        name = name.strip()
+        if name:
+            parsed.append((name, value.strip() if sep else ""))
+    return tuple(parsed)
 
 
 @dataclass(frozen=True)
@@ -57,6 +82,7 @@ class HIPOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # No-op placeholder
+    multicast: bool = False  # No-op placeholder (TMA multicast is NVIDIA-only)
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False
@@ -85,6 +111,11 @@ class HIPOptions:
     # schedule_hint="attention,memory-bound-attention"
     schedule_hint: str = "none"
 
+    # Experimental: intended for development and debugging; may change or be removed without notice.
+    # Comma-separated LLVM function attributes; bare names are emitted as valueless attributes.
+    # Example: llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp,noinline"
+    llvm_fn_attrs: str | Tuple[Tuple[str, str], ...] = ""
+
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
         warp_size = 32 if gfx_major >= 10 else 64
@@ -96,6 +127,8 @@ class HIPOptions:
                 f"kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = {self.kpack} will be overwritten to 1 to make transitioning easier."
             )
             object.__setattr__(self, "kpack", 1)
+
+        object.__setattr__(self, 'llvm_fn_attrs', _parse_llvm_fn_attrs(self.llvm_fn_attrs))
 
         default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -227,10 +260,13 @@ class HIPBackend(BaseBackend):
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
+        passes.ttir.add_simplify_single_trip_while(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
+        passes.ttir.add_uplift_while_to_for(pm)
+        passes.common.add_canonicalizer(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, "make_ttir")
@@ -251,7 +287,7 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         emuTF32 = False
-        passes.ttgpuir.add_coalesce(pm)
+        passes.ttgpuir.add_coalesce(pm, 128)
         if knobs.amd.use_buffer_ops:
             amd.passes.ttgpuir.add_coalesce_buffer_ops(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0)
@@ -284,6 +320,7 @@ class HIPBackend(BaseBackend):
 
         use_async_copy = is_async_copy_enabled(options.arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
+        amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
 
         # E4: when TRITON_ENABLE_AMD_MODULO is set, the AMD modulo scheduler
         # replaces schedule-loops — it builds the DDG (TritonGPUModuloCore) with
@@ -296,6 +333,7 @@ class HIPBackend(BaseBackend):
             # replacing schedule_loops + add_pipeline. async_wait counts are
             # fixed by add_update_async_wait_count downstream.
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "early-lower")
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "modulo")
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "expand")
         elif os.environ.get("TRITON_ENABLE_AMD_MODULO"):
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
@@ -321,6 +359,9 @@ class HIPBackend(BaseBackend):
         if is_in_thread_transpose_enabled(options.arch):
             amd.passes.ttgpuir.add_in_thread_transpose(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+        # User-pinned register layouts (#tlx.user_layout) anchored the loads
+        # through the layout-optimization passes above; retire the markers now.
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
         amd.passes.ttgpuir.add_move_up_prologue_loads(pm)
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
@@ -361,6 +402,9 @@ class HIPBackend(BaseBackend):
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
+        # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
+        # the ops. Runs last so the reported layouts reflect all optimizations.
+        tlx.tlx_passes.add_tlx_dump_layout(pm)
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
@@ -399,13 +443,16 @@ class HIPBackend(BaseBackend):
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
-
-        amd.passes.ttgpuir.add_allocate_shared_memory(pm)
+        amd.passes.ttgpuir.add_allocate_shared_memory(pm, options.arch)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
+        if knobs.amd.use_buffer_ops:
+            # CSE matching assume and loop-bound expressions before range analysis.
+            passes.common.add_cse(pm)
+            amd.passes.ttgpuir.add_annotate_buffer_op_split_safety(pm)
         ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
         ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
         ##    of the value of kernel arg `allow_flush_denorm`.
@@ -500,18 +547,24 @@ class HIPBackend(BaseBackend):
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
         fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
+        if is_expert_sched_supported(options.arch) and options.num_warps <= 4:
+            fns[0].add_fn_attr("amdgpu-sched-strategy", "coexec")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
             fns[0].add_fn_target_feature("+xnack")
             fns[0].add_fn_asan_attr()
+        for name, value in options.llvm_fn_attrs:
+            fns[0].remove_fn_attr(name)
+            fns[0].add_fn_attr(name, value)
 
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
         # from memory.
+        #
         # TODO(tyb0807): Disabled when using MIR swap/dump because the value is
         # not serializable to/from MIR YAML
-        if options.arch != "gfx1250" and not (knobs.amd.swap_mir or knobs.amd.dump_mir):
+        if not (knobs.amd.swap_mir or knobs.amd.dump_mir):
             amd.set_all_fn_arg_inreg(fns[0])
 
         if knobs.compilation.enable_asan:
@@ -527,7 +580,8 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion, True)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion,
+                             disable_vector_combine=True)
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
@@ -565,7 +619,9 @@ class HIPBackend(BaseBackend):
         metadata["name"] = names[0]
         # llvm -> hsaco
         flags = []
-        features = "-real-true16" if "gfx11" in options.arch else ""
+        if is_expert_sched_supported(options.arch):
+            flags.append("amdgpu-expert-scheduling-mode")
+        features = disable_real_true16_feature(options.arch)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + "_" + ir_hash
         _ = llvm.translate_to_mir(
@@ -608,6 +664,7 @@ class HIPBackend(BaseBackend):
                 flags,
                 options.enable_fp_fusion,
                 False,
+                False,
             )
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
@@ -616,12 +673,12 @@ class HIPBackend(BaseBackend):
 
     @staticmethod
     def make_hsaco(src, metadata, options):
-        target_features = ""
+        target_features = []
         if knobs.compilation.enable_asan:
-            target_features = "+xnack"
-        if "gfx11" in options.arch:
-            target_features += ",-real-true16"
-        hsaco = amd.assemble_amdgcn(src, options.arch, target_features)
+            target_features.append("+xnack")
+        if true16 := disable_real_true16_feature(options.arch):
+            target_features.append(true16)
+        hsaco = amd.assemble_amdgcn(src, options.arch, ",".join(target_features))
         with tempfile.NamedTemporaryFile() as tmp_out:
             with tempfile.NamedTemporaryFile() as tmp_in:
                 with open(tmp_in.name, "wb") as fd_in:

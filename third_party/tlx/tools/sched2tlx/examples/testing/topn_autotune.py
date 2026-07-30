@@ -10,14 +10,14 @@ true-best schedule may be rank 2 or 3. This driver, per case:
      ({"variants": [doc0, doc1, ...]}, best-predicted first);
   2. splits it into per-variant schedule_graph.json files and emits each with
      ``python -m sched2tlx`` (an emit failure marks that variant, not the run);
-  3. benchmarks every emitted variant through ``perf_engine.py worker`` — one
-     subprocess per variant so a faulting kernel cannot poison the next run's
-     CUDA context; correctness (vs torch reference and, for variant 0, the
-     handwritten kernel) gates a variant from winning;
+  3. benchmarks every emitted variant through ``perf_regression/perf_harness.py``'s
+     ``run_bench`` — one subprocess per variant so a faulting kernel cannot
+     poison the next run's CUDA context; correctness (vs torch reference and,
+     for variant 0, the handwritten kernel) gates a variant from winning;
   4. writes an aggregate JSON + prints a predicted-vs-measured table with the
      rank correlation and the measured winner.
 
-Bench methodology is perf_engine's uniformly: triton.testing.do_bench (cold-L2
+Bench methodology is perf_harness's uniformly: triton.testing.do_bench (cold-L2
 flush, median). Never mix these numbers with hand-rolled hot-L2 loops.
 
 Usage (venv python with torch + triton and a Blackwell GPU):
@@ -40,6 +40,24 @@ EXAMPLES_DIR = TESTING_DIR.parent
 TOOL_DIR = EXAMPLES_DIR.parent  # holds the sched2tlx/ package
 
 WORKER_TIMEOUT_S = 900
+
+PERF_HARNESS = TESTING_DIR / "perf_regression" / "perf_harness.py"
+
+# Inline worker. examples/testing/perf_engine.py and its ``worker`` subcommand
+# are gone; perf_regression/perf_harness.py keeps the same
+# run_bench(case_dir, generated_path, want_hw) API and row schema but exposes
+# only ``compare``. Drive run_bench directly in a fresh process so a faulting
+# kernel still cannot poison the next variant's CUDA context.
+_WORKER_SRC = """
+import importlib.util, json, sys
+from pathlib import Path
+_s = importlib.util.spec_from_file_location("perf_harness", sys.argv[1])
+_m = importlib.util.module_from_spec(_s)
+_s.loader.exec_module(_m)
+Path(sys.argv[4]).write_text(json.dumps(
+    _m.run_bench(Path(sys.argv[2]), Path(sys.argv[3]), want_hw=(sys.argv[5] == "1"))
+))
+"""
 
 
 def _clean_env() -> dict[str, str]:
@@ -95,14 +113,13 @@ def bench_variant(case_dir: Path, kernel_py: Path, out_json: Path, want_hw: bool
     """Benchmark one variant in an isolated worker process."""
     cmd = [
         sys.executable,
-        str(TESTING_DIR / "perf_engine.py"),
-        "worker",
-        "--case-dir", str(case_dir),
-        "--generated", str(kernel_py),
-        "--out", str(out_json),
+        "-c", _WORKER_SRC,
+        str(PERF_HARNESS),
+        str(case_dir),
+        str(kernel_py),
+        str(out_json),
+        "1" if want_hw else "0",
     ]
-    if not want_hw:
-        cmd.append("--no-hw")
     try:
         proc = subprocess.run(
             cmd, env=_clean_env(), capture_output=True, text=True, timeout=WORKER_TIMEOUT_S

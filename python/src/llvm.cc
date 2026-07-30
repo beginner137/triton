@@ -1,9 +1,10 @@
 #include "mlir/IR/BuiltinOps.h" // mlir::ModuleOp
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/MIRParser/MIRParser.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -31,6 +32,7 @@
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
+#include "llvm/Transforms/Scalar.h"
 #include <csignal>
 #include <cstdio>
 #include <memory>
@@ -323,12 +325,10 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
   return result;
 }
 
-std::string translateLLVMIRToASM(llvm::Module &module,
-                                 const std::string &triple,
-                                 const std::string &proc,
-                                 const std::string &features,
-                                 const std::vector<std::string> &flags,
-                                 bool enable_fp_fusion, bool isObject) {
+std::string translateLLVMIRToASM(
+    llvm::Module &module, const std::string &triple, const std::string &proc,
+    const std::string &features, const std::vector<std::string> &flags,
+    bool enable_fp_fusion, bool isObject, bool canonicalizeGEP) {
   using namespace mlir;
 
   // Apply flags
@@ -391,6 +391,16 @@ std::string translateLLVMIRToASM(llvm::Module &module,
   auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features);
   // set data layout
   module.setDataLayout(machine->createDataLayout());
+  if (canonicalizeGEP && !disableLLVMOpt) {
+    // The NVPTX pipeline otherwise exposes many equivalent GEPs to SLSR
+    // without eliminating them first.
+    llvm::legacy::PassManager cleanup;
+    cleanup.add(llvm::createTargetTransformInfoWrapperPass(
+        machine->getTargetIRAnalysis()));
+    cleanup.add(llvm::createSeparateConstOffsetFromGEPPass());
+    cleanup.add(llvm::createEarlyCSEPass());
+    cleanup.run(module);
+  }
   // emit machine code
   std::string result;
   {
@@ -572,8 +582,15 @@ void init_triton_llvm(py::module &&m) {
       .def_property_readonly(
           "name", [](llvm::Function *fn) { return fn->getName().str(); })
       .def("set_calling_conv", &llvm::Function::setCallingConv)
-      .def("add_fn_attr", [](llvm::Function *fn, std::string &name,
-                             std::string &val) { fn->addFnAttr(name, val); })
+      .def(
+          "add_fn_attr",
+          [](llvm::Function *fn, std::string &name, std::string &val) {
+            if (val.empty())
+              fn->addFnAttr(name);
+            else
+              fn->addFnAttr(name, val);
+          },
+          py::arg("name"), py::arg("val") = "")
       .def("remove_fn_attr", [](llvm::Function *fn,
                                 std::string &name) { fn->removeFnAttr(name); })
       .def("add_fn_asan_attr",
@@ -649,7 +666,8 @@ void init_triton_llvm(py::module &&m) {
       "optimize_module",
       [](llvm::Module *mod, const llvm::OptimizationLevel &opt,
          std::string arch, std::string features, std::vector<std::string> flags,
-         bool enable_fp_fusion, bool disable_vector_combine) {
+         bool enable_fp_fusion, bool disable_slp_vectorizer,
+         bool disable_vector_combine) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Check to see if we are passing a list of flags to disable
@@ -782,6 +800,7 @@ void init_triton_llvm(py::module &&m) {
       py::arg("arch") = "", py::arg("features") = "",
       py::arg("flags") = std::vector<std::string>{},
       py::arg("enable_fp_fusion") = false,
+      py::arg("disable_slp_vectorizer") = false,
       py::arg("disable_vector_combine") = false,
       py::call_guard<py::gil_scoped_release>());
 
@@ -789,7 +808,8 @@ void init_triton_llvm(py::module &&m) {
       "translate_to_asm",
       [](std::string llvmIR, std::string triple, std::string proc,
          std::string features, std::vector<std::string> flags,
-         bool enable_fp_fusion, bool isObject) -> py::object {
+         bool enable_fp_fusion, bool isObject,
+         bool canonicalizeGEP) -> py::object {
         std::string obj;
         {
           // when allow_threads goes out of scope, gil will be released
@@ -806,8 +826,9 @@ void init_triton_llvm(py::module &&m) {
                 "failed to parse IR: " + error.getMessage() +
                 "lineno: " + std::to_string(error.getLineNo()));
           }
-          obj = translateLLVMIRToASM(*module, triple, proc, features, flags,
-                                     enable_fp_fusion, isObject);
+          obj =
+              translateLLVMIRToASM(*module, triple, proc, features, flags,
+                                   enable_fp_fusion, isObject, canonicalizeGEP);
         }
         if (isObject)
           return py::bytes(obj);

@@ -6,6 +6,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/NVPTXAddrSpace.h"
 
@@ -128,7 +129,7 @@ matchReduxKind(triton::ReduceOp op, int computeCapability,
 }
 
 bool TargetInfo::supportMaximumMinimum() const {
-  return computeCapability >= 80;
+  return targetFeatures.supportMaximumMinimum();
 }
 
 Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
@@ -153,19 +154,42 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
   b.barrier(targets);
 }
 
+void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
+  triton::nvidia_gpu::ClusterArriveOp::create(rewriter, loc, /*relaxed=*/false);
+  triton::nvidia_gpu::ClusterWaitOp::create(rewriter, loc);
+}
+
 void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   NVVM::SyncWarpOp::create(rewriter, loc, b.i32_val(0xffffffff));
 }
 
+static bool isConstantTruePred(Value pred) {
+  if (auto constOp = pred.getDefiningOp<LLVM::ConstantOp>()) {
+    return cast<IntegerAttr>(constOp.getValue()).getInt() == -1;
+  }
+  return false;
+}
+
 static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
                   Value pred) {
+  auto *ctx = rewriter.getContext();
+  auto clusterPtrTy = ptr_ty(ctx, /*addrspace=*/7);
+  if (isConstantTruePred(pred)) {
+    return NVVM::MapaOp::create(rewriter, loc, clusterPtrTy, ptr, ctaid);
+  }
+
+  PTXBuilder builder;
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
-  assert(ptrTy.getAddressSpace() == llvm::NVPTXAS::ADDRESS_SPACE_SHARED &&
-         "Invalid src llvm addr space for mapa");
-  MLIRContext *ctx = rewriter.getContext();
-  auto dsmPtrTy = ptr_ty(ctx, llvm::NVPTXAS::ADDRESS_SPACE_SHARED_CLUSTER);
-  return NVVM::MapaOp::create(rewriter, loc, dsmPtrTy, ptr, ctaid);
+  assert(ptrTy.getAddressSpace() == 3);
+
+  auto &mapaInstr = *builder.create("mapa");
+  mapaInstr.o("shared::cluster.u32");
+  auto *dstOpr = builder.newOperand("=r");
+  auto *ptrOpr = builder.newOperand(ptr, "r");
+  auto *ctaidOpr = builder.newOperand(ctaid, "r");
+  mapaInstr(dstOpr, ptrOpr, ctaidOpr).predicate(pred, "b");
+  return builder.launch(rewriter, loc, clusterPtrTy, /*hasSideEffect=*/false);
 }
 
 static std::string getConstraintForBitwidth(unsigned bitwidth) {
@@ -180,13 +204,6 @@ static std::string getConstraintForBitwidth(unsigned bitwidth) {
   default:
     llvm_unreachable("unsupported bitwidth");
   }
-}
-
-static bool isConstantTruePred(Value pred) {
-  if (auto constOp = pred.getDefiningOp<LLVM::ConstantOp>()) {
-    return cast<IntegerAttr>(constOp.getValue()).getInt() == -1;
-  }
-  return false;
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
@@ -261,7 +278,6 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     assert(elemBitwidth == 32 || elemBitwidth == 64);
     int maxVec = 128 / elemBitwidth;
 
-    auto newVecTy = vec_ty(elemTy, maxVec);
     SmallVector<Value> vals = unpackLLVector(loc, val, rewriter);
     for (int i = 0; i < vec / maxVec; i++) {
       auto newPtr = b.gep(ptr.getType(), elemTy, ptr, b.i32_val(i * maxVec),
@@ -445,7 +461,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   PTXBuilder builder;
   auto ld = builder.create("ld")
-                ->o("shared::cta", ctaId.has_value())
+                ->o("shared::cluster", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);
@@ -515,7 +531,8 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
                             unsigned interleave) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   bool useNanQualifier = false;
-  if (auto kind = matchReduxKind(op, computeCapability, useNanQualifier)) {
+  if (auto kind = matchReduxKind(op, targetFeatures.getComputeCapability(),
+                                 useNanQualifier)) {
     // Based on benchmarking on A100 redux op gives a speed up only when doing
     // a single reduction (not partitioned) and when the mask is static.
     // Therefore we currently only enable it to reduce across all the lanes.
@@ -568,7 +585,6 @@ void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
                         ArrayRef<bool> isSigned) const {
   auto *ctx = rewriter.getContext();
   Type ptr = ptr_ty(ctx);
-  auto moduleOp = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
   auto funcOp = getVprintfDeclaration(rewriter);
   auto loc = UnknownLoc::get(ctx);
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -625,7 +641,6 @@ void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
                             int line) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto funcOp = getAssertfailDeclaration(rewriter);
-  auto moduleOp = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
   llvm::SmallString<64> messageString(message), fileString(file),
       funcString(func);
   messageString.push_back('\0');
@@ -664,7 +679,7 @@ int TargetInfo::getAddressSpace(Attribute addressSpace) const {
 }
 
 bool TargetInfo::supportVectorizedAtomics() const {
-  return computeCapability >= 90 && ptxVersion >= 81;
+  return targetFeatures.getComputeCapability() >= 90 && ptxVersion >= 81;
 }
 
 } // namespace mlir::triton::NVIDIA

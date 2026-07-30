@@ -16,13 +16,15 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // Step 4.5: Merge first (before budget check — reduces memory footprint)
-// Step 4.6: Budget check passes (SMEM ~65KB << 232KB, TMEM ~196KB << 256KB)
+// Step 4.6: Budget check passes (SMEM ~64KB << 227KB, TMEM ~128KB << 256KB)
 //
+// 6 buffers = 3 data (A/B SMEM operand rings now double-buffered + TMEM acc,
+// each count=2) plus their 3 paired barriers; they merge to 3 physical groups.
 // CHECK: [Step4.5] 6 buffers -> 3 physical groups
 // CHECK: [Step4.6] Budget: SMEM {{[0-9]+}}/{{[0-9]+}} OK, TMEM {{[0-9]+}}/{{[0-9]+}} OK
 tt.func @test_budget_and_merge(
-  %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
-  %b_desc: !tt.tensordesc<tensor<64x128xf16>>
+  %a_desc: !tt.tensordesc<128x64xf16>,
+  %b_desc: !tt.tensordesc<64x128xf16>
 ) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32
@@ -33,8 +35,8 @@ tt.func @test_budget_and_merge(
   scf.for %k = %c0_i32 to %k_tiles step %c1_i32 iter_args(%acc = %zero) -> (tensor<128x128xf32, #acc_layout>) : i32 {
     %off_k = arith.muli %k, %c1_i32 : i32
 
-    %a = tt.descriptor_load %a_desc[%c0_i32, %off_k] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
-    %b = tt.descriptor_load %b_desc[%off_k, %c0_i32] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked>
+    %a = tt.descriptor_load %a_desc[%c0_i32, %off_k] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
+    %b = tt.descriptor_load %b_desc[%off_k, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked>
 
     %a_shared = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
     %b_shared = ttg.local_alloc %b : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem>

@@ -6,7 +6,7 @@ import pytest
 
 import pathlib
 import uuid
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, is_hip_cdna, is_rubin
 from triton.runtime import autotuner as _autotuner
 
 
@@ -85,6 +85,70 @@ def test_restore(pass_kwargs_to_kernel, device):
     triton.testing.assert_close(src, torch.ones_like(src))
 
 
+@pytest.mark.parametrize('src_is_none', [False, True])
+@pytest.mark.parametrize('pass_kwargs_to_kernel', [False, True])
+def test_reset_to_zero(pass_kwargs_to_kernel, src_is_none, device):
+    # Kernels often take optional tensor args (e.g. an extra buffer used only
+    # when a constexpr flag is set), and idiomatically pass None when the arg
+    # is unused. Such an arg may still be listed for reset_to_zero because some
+    # call sites do mutate it. The autotuner's default pre-hook must skip None.
+    N = 1024
+    dst = torch.full((N, ), 2.0, device=device)
+    src = None if src_is_none else dst
+
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+
+    @triton.autotune(configs=configs, key=['N'], reset_to_zero=['src'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        if src is not None:
+            tl.store(src + offsets, tl.full([BLOCK_SIZE], 1, dtype=src.dtype.element_ty), mask=mask)
+        else:
+            tl.store(dst + offsets, tl.full([BLOCK_SIZE], 1, dtype=dst.dtype.element_ty), mask=mask)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    if pass_kwargs_to_kernel:
+        _kernel[grid](src=src, dst=dst, N=N)
+    else:
+        _kernel[grid](src, dst, N)
+    triton.testing.assert_close(dst, torch.ones_like(dst))
+
+
+@pytest.mark.parametrize('pass_kwargs_to_kernel', [False, True])
+def test_restore_with_none(pass_kwargs_to_kernel, device):
+    # Kernels often take optional tensor args (e.g. an extra buffer used only
+    # when a constexpr flag is set), and idiomatically pass None when the arg
+    # is unused. Such an arg may still be listed in restore_value because some
+    # call sites do mutate it. The autotuner's default pre/post hooks must
+    # skip None entries instead of crashing with
+    # "AttributeError: 'NoneType' object has no attribute 'clone'".
+    N = 1024
+    src = None
+    dst = torch.full((N, ), 2.0, device=device)
+
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+
+    @triton.autotune(configs=configs, key=['N'], restore_value=['src'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        if src is not None:
+            tl.store(src + offsets, tl.full([BLOCK_SIZE], 1, dtype=src.dtype.element_ty), mask=mask)
+        else:
+            tl.store(dst + offsets, tl.full([BLOCK_SIZE], 1, dtype=dst.dtype.element_ty), mask=mask)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    if pass_kwargs_to_kernel:
+        _kernel[grid](src=src, dst=dst, N=N)
+    else:
+        _kernel[grid](src, dst, N)
+    triton.testing.assert_close(dst, torch.ones_like(dst))
+
+
+@pytest.mark.skipif(is_hip_cdna(), reason="Hit LLVM assertion in splitLiveThroughBlock")
 def test_hooks(device):
     # Autotuner's pre- and post- hooks should be called the same number of times
     N = 4096
@@ -104,7 +168,7 @@ def test_hooks(device):
         assert values["counter"] == 0
 
     @triton.autotune(configs=configs, key=['N'], do_bench=do_bench, pre_hook=_pre_hook, post_hook=_post_hook)
-    @triton.heuristics({"N_STAGES": lambda nargs: 100 if nargs['N'] == 4096 else 4})
+    @triton.heuristics({"N_STAGES": lambda nargs: 64 if nargs['N'] == 4096 else 4})
     @triton.jit
     def _kernel(src, N, N_STAGES: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         offsets = tl.arange(0, BLOCK_SIZE)
@@ -117,8 +181,7 @@ def test_hooks(device):
     _kernel[(1, )](src, N)
 
     # On NVIDIA GPUs:
-    # The tuning knob `num_stages` can be set by users.
-    # This will cause out of resources when N_STAGES = 100
+    # This will cause out of resources when N_STAGES = 64
     # shared memory bytes = N_STAGES * BLOCK_SIZE * sizeof(float)
     # On AMD GPUs:
     # `num_stages` is a fixed value of 2, so it won't cause out of resources
@@ -405,9 +468,10 @@ def test_exceed_tmem(device):
         tl.store(dst + tl.arange(0, BLOCK_SIZE * BLOCK_SIZE), c)
 
     dot_kernel[(1, )](dst)
+    tmem_size = 576 if is_rubin() else 512
     assert exception_out_of_resource is not None and str(
         exception_out_of_resource
-    ) == "out of resource: tensor memory, Required: 640, Hardware limit: 512. Reducing block sizes or `num_stages` may help."
+    ) == f"out of resource: tensor memory, Required: 640, Hardware limit: {tmem_size}. Reducing block sizes or `num_stages` may help."
 
 
 def test_exceed_threads(device):

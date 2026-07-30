@@ -241,6 +241,26 @@ def _timed_measurement(kernel_call, clear_cache, n_repeat, torch):
     return torch.tensor([s.elapsed_time(e) for s, e in zip(start_ev, end_ev)], dtype=torch.float)
 
 
+class _AutotuneCache(dict):
+    """dict that invalidates C autotune proxy when cleared."""
+
+    def __init__(self, autotuner):
+        super().__init__()
+        self._autotuner = autotuner
+
+    def __reduce__(self):
+        return (dict, ())
+
+    def clear(self):
+        super().clear()
+        if hasattr(self._autotuner, '_autotune_proxy'):
+            del self._autotuner._autotune_proxy
+        if hasattr(self._autotuner, '_at_proxy_seeded'):
+            self._autotuner._at_proxy_seeded = set()
+        if hasattr(self._autotuner, '_fc_seeded'):
+            self._autotuner._fc_seeded = set()
+
+
 class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
@@ -280,7 +300,7 @@ class Autotuner(KernelInterface):
             self.configs = configs
         self.keys = key
         self.include_npot = include_npot
-        self.cache: Dict[Tuple, Config] = {}
+        self.cache: Dict[Tuple, Config] = _AutotuneCache(self)
         self.arg_names = arg_names
         self.cache_results = (cache_results or knobs.autotuning.cache) and not knobs.runtime.interpret
 
@@ -304,9 +324,14 @@ class Autotuner(KernelInterface):
 
             def _pre_hook(kwargs, reset_only=False):
                 for name in self.reset_to_zero:
-                    kwargs[name].zero_()
+                    if kwargs[name] is not None:
+                        kwargs[name].zero_()
                 if not reset_only:
-                    self.restore_copies = {name: kwargs[name].clone() for name in self.restore_value}
+                    self.restore_copies = {
+                        name: kwargs[name].clone()
+                        for name in self.restore_value
+                        if kwargs[name] is not None
+                    }
 
             self.pre_hook = _pre_hook
 
@@ -316,8 +341,8 @@ class Autotuner(KernelInterface):
         elif len(self.restore_value) > 0:
 
             def _post_hook(kwargs, exception):
-                for name in self.restore_value:
-                    kwargs[name].copy_(self.restore_copies[name])
+                for name, value in self.restore_copies.items():
+                    kwargs[name].copy_(value)
                 self.restore_copies = {}
 
             self.post_hook = _post_hook
@@ -563,7 +588,8 @@ class Autotuner(KernelInterface):
         """Return C-level AutotuneCacheProxy for fast dispatch if available."""
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
-                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1):
+                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
+                and knobs.autotuning.listener is None):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields
@@ -735,7 +761,15 @@ class Autotuner(KernelInterface):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
                     native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
                                                 _disp, getattr(kernel, '_dispatch_arg_indices', None))
-            self._fc_seeded.add(_seed_key)
+                    # Only enable the meta-less steady-state fast path (self.fn[grid](*full_args)
+                    # below) once a native dispatcher exists to carry the winning config's
+                    # compilation options. Without one -- e.g. dispatcher creation failed with
+                    # "Too many kernel args" -- steady-state falls back to a plain JIT launch that
+                    # recompiles at the default num_warps/num_stages and silently drops the config's
+                    # values, miscompiling kernels pinned to a non-default num_warps. Leaving
+                    # _seed_key unseeded re-runs this seed branch (a full run(**_meta) that honors
+                    # the config) on every call instead.
+                    self._fc_seeded.add(_seed_key)
             return kernel
 
         # Steady-state: dispatch via JITCacheProxy (fastest path).
@@ -827,6 +861,19 @@ class Autotuner(KernelInterface):
                     used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
                 else:
                     benchmark()
+
+                if knobs.autotuning.listener is not None:
+                    jit_fn = self.fn
+                    while not isinstance(jit_fn, JITFunction):
+                        jit_fn = jit_fn.fn
+                    knobs.autotuning.listener(
+                        fn=jit_fn,
+                        key=key,
+                        best_config=self.cache[key],
+                        configs_timings=self.configs_timings,
+                        duration=getattr(self, 'bench_time', None) if not used_cached_result else None,
+                        cache_hit=used_cached_result,
+                    )
 
             config = self.cache[key]
             self._last_key = key
@@ -1003,6 +1050,8 @@ class Config:
         required, this is a hint: the driver may use a smaller cluster if resources are constrained.
         Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
     :type preferred_ctas_per_cga: tuple[int, int, int]
+    :ivar multicast: default policy for compiler-selected TMA multicast loads.
+    :type multicast: bool
     """
 
     @staticmethod
@@ -1028,8 +1077,11 @@ class Config:
         reg_inc_consumer=0,
         ctas_per_cga=None,
         early_tma_store_lowering=None,
+        tma_store_pipelining=None,
         generate_subtiled_region=None,
         preferred_ctas_per_cga=None,
+        multicast=False,
+        auto_tma=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1045,8 +1097,13 @@ class Config:
         self.pingpongAutoWS = pingpongAutoWS
         self.ctas_per_cga = ctas_per_cga
         self.early_tma_store_lowering = early_tma_store_lowering
+        self.tma_store_pipelining = tma_store_pipelining
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
+        self.multicast = multicast
+        # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
+        # knob; True/False lets the autotuner A/B auto-TMA per shape.
+        self.auto_tma = auto_tma
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -1061,8 +1118,11 @@ class Config:
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
+        self.tma_store_pipelining = state.get("tma_store_pipelining", None)
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
+        self.multicast = state.get("multicast", False)
+        self.auto_tma = state.get("auto_tma", None)
 
     def all_kwargs(self):
         return {
@@ -1080,8 +1140,11 @@ class Config:
                     ("pingpongAutoWS", self.pingpongAutoWS),
                     ("ctas_per_cga", self.ctas_per_cga),
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
+                    ("tma_store_pipelining", self.tma_store_pipelining),
                     ("generate_subtiled_region", self.generate_subtiled_region),
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
+                    ("multicast", self.multicast),
+                    ("auto_tma", self.auto_tma),
                 ) if v is not None
             },
         }
@@ -1099,8 +1162,11 @@ class Config:
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
+        res.append(f"tma_store_pipelining: {self.tma_store_pipelining}")
         res.append(f"generate_subtiled_region: {self.generate_subtiled_region}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
+        res.append(f"multicast: {self.multicast}")
+        res.append(f"auto_tma: {self.auto_tma}")
         return ", ".join(res)
 
     def __hash__(self):

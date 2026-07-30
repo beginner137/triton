@@ -1,4 +1,4 @@
-"""Benchmark spec for case1 (simple GEMM) consumed by examples/testing/perf_engine.py.
+"""Benchmark spec for case1 (simple GEMM) consumed by examples/testing/perf_regression/perf_harness.py.
 
 Launch logic mirrors run_generated.py (generated) and handwritten.gemm (reference).
 """
@@ -11,7 +11,12 @@ import triton
 BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
 TOL = 5e-3
 
-SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096)]
+SHAPES = [
+    (1024, 1024, 1024),
+    (2048, 2048, 2048),
+    (4096, 4096, 4096),
+    (8192, 8192, 8192),
+]
 
 
 def make_inputs(shape):

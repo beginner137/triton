@@ -116,6 +116,16 @@ def buffer_load_to_local(
     Directly emits amdg.buffer_load_to_local. The ConvertTritonToTritonGPU pass
     adds tensor encoding, and the AMD backend lowers it to LLVM.
 
+    This lowers to a single direct-to-LDS hardware copy, which fails to lower with
+    a compile-time error unless the following requirements are met:
+    - Each thread's load must reach a supported direct-to-LDS width (32 or 128
+      bits, e.g. 2 or 8 fp16 elements). A smaller vectorization cannot be lowered.
+    - The alignment needed for that width must be statically provable.
+    - If `mask` is given it must be aligned to the vector width: each group of
+      (vector width) consecutive mask values must be identical. The copy moves
+      each lane's whole vector in one transaction, so a mask whose boundary cannot
+      be proven vector-aligned (e.g. `offs < K` for runtime `K`) cannot lower.
+
     Args:
         dest: Destination buffer in shared memory (buffered_tensor).
         ptr: Global memory scalar base pointer.
@@ -145,6 +155,32 @@ def buffer_load_to_local(
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
                                                            other_handle, cache_mod)
     return tlx.async_token(handle)
+
+
+@tl.builtin
+def zeros(
+    shape: tuple,
+    dtype: tl.dtype,
+    layout: tl.constexpr = None,
+    _semantic=None,
+):
+    """Create a zero tensor with an optional explicit register layout.
+
+    Triton's regular ``tl.zeros`` intentionally creates an unresolved block
+    tensor.  Gluon MFMA code instead materializes its accumulator directly in
+    the MFMA layout; the layout-aware form keeps that constant from requiring a
+    later conversion (and is useful for TLX AMD dot probes and kernels).
+    """
+    shape = [tl._unwrap_if_constexpr(s) for s in tl._unwrap_if_constexpr(shape)]
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if layout is None:
+        return _semantic.full(shape, 0, dtype)
+    layout = tl._unwrap_if_constexpr(layout)
+    assert isinstance(layout, tlx.layout_encoding), "zeros layout must be a TLX layout encoding"
+    scalar = _semantic.scalar_constant(0, dtype)
+    encoding = layout.to_ir(_semantic.builder, shape, dtype)
+    handle = _semantic.builder.create_splat_with_layout(shape, dtype.to_ir(_semantic.builder), encoding, scalar.handle)
+    return tl.tensor(handle, tl.block_type(dtype, shape))
 
 
 @tl.builtin
@@ -293,7 +329,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     if layout is None:
         if storage == tlx.storage_kind.smem:
             if len(shape) == 1:
-                layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
                 layout._tlx_default = True
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
@@ -305,7 +341,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.numCTAOrder,
                 )
             elif _semantic.builder.options.arch.startswith("gfx"):
-                layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
                 layout._tlx_default = True
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
@@ -344,9 +380,19 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         if storage != tlx.storage_kind.smem:
             raise NotImplementedError("User-specified layout encoding is only supported for shared memory (smem)")
         layout = tl._unwrap_if_constexpr(layout)
+        # A CuTe swizzled_layout (Swizzle<B,M,S>) needs the buffer shape to resolve
+        # its perPhase; do it now that shape is known.
+        if isinstance(layout, tlx.swizzled_layout):
+            layout = layout._to_encoding(unwrapped_shape)
         if not isinstance(layout, tlx.shared_layout_encoding):
             raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
         layout_handle = layout.to_ir(_semantic.builder)
+        # This is an explicit, user-pinned layout: wrap it so layout propagation
+        # respects it (does not retag the buffer to satisfy a consumer). The
+        # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
+        if not getattr(layout, "_tlx_default", False):
+            layout._tlx_user_pinned = True
+            layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
 
     alias_handle = None
     shared_buffer_handle = None
@@ -855,10 +901,16 @@ def local_load(
         output = _semantic.builder.create_release_layout(load_handle)
         return tl.tensor(output, block_type)
     else:
-        output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         if layout is not None:
+            # Pin the load result to the requested register layout, wrapped as a
+            # user layout so remove-layout-conversions anchors it (won't rewrite
+            # it to a "preferred" layout). Unlike require_layout, this survives
+            # even when the only consumer is layout-flexible.
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
-            output = _semantic.builder.create_require_layout(output, enc)
+            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None,
+                                                         layoutEncoding=enc)
+        else:
+            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)
         if (token is not None or relaxed) and _semantic.builder.options.backend_name == "hip":
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
@@ -917,6 +969,56 @@ def local_store(
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
     return tl.tensor(_semantic.builder.create_local_store(dst.handle, src.handle), tl.void)
+
+
+@tl.builtin
+def assert_same_layout(
+    lhs,
+    rhs,
+    _semantic=None,
+) -> None:
+    """Statically assert that two final layouts are equivalent.
+
+    ``rhs`` may be another register/buffer value or a constant TLX layout. The
+    comparison runs after TTGIR layout propagation and compares LinearLayouts.
+    """
+    rhs = tl._unwrap_if_constexpr(rhs)
+    if isinstance(rhs, (tl.tensor, tlx.buffered_tensor)):
+        _semantic.builder.create_assert_same_layout(lhs.handle, rhs.handle)
+        return
+    if not isinstance(rhs, tlx.layout_encoding):
+        raise TypeError("`rhs` must be a TLX tensor/buffer value or layout encoding")
+    if isinstance(rhs, tlx.layout):
+        expected_encoding = rhs.to_ir(_semantic.builder, lhs.type.shape, lhs.type.element_ty)
+    else:
+        expected_encoding = rhs.to_ir(_semantic.builder)
+    _semantic.builder.create_assert_same_layout_expected(lhs.handle, expected_encoding)
+
+
+@tl.builtin
+def dump_layout(
+    x,
+    _semantic=None,
+) -> None:
+    """
+    Compile-time diagnostic that prints the resolved layout of a value.
+
+    ``x`` may be a register tensor (``tl.tensor``) or a shared/tensor-memory
+    buffer (``tlx.buffered_tensor``). The value's type, encoding, and expanded
+    linear layout are printed to the compiler log during compilation; no device
+    code is emitted and nothing is returned.
+
+    The layout is rendered in CuTe ``Shape:Stride`` notation and maps a
+    coordinate to the *logical* tensor's row-major element index (its codomain):
+    for a register tensor a ``(thread, value)`` coordinate -> the logical
+    element index it holds, and for a buffer an offset -> the buffer element
+    index. Strides are offsets in that logical index space, not physical
+    byte/bank addresses.
+
+    This is a static host-side diagnostic and is distinct from the runtime,
+    device-side ``tl.device_print`` / ``tl.print``.
+    """
+    _semantic.builder.create_dump_layout(x.handle)
 
 
 def _shape_as_ints(shape):
@@ -1020,7 +1122,7 @@ def local_reshape(
     assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
         "TLX local_reshape only supports SMEM")
     reshape_handle = _semantic.builder.create_memdesc_reshape(src.handle, shape)
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+    layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
     return tlx.buffered_tensor(
         reshape_handle,
         src.type.scalar,
@@ -1036,26 +1138,41 @@ def local_reinterpret(
     src: tlx.buffered_tensor,
     dtype: tl.dtype,
     shape: list[tl.constexpr] = None,
+    layout: tl.constexpr = None,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
-    Reinterpret the dtype and shape of a buffered tensor. Layout is preserved.
+    Reinterpret the dtype and shape of a buffered tensor.
+
+    When ``layout`` is supplied, the descriptor is also viewed through that
+    explicit shared-memory layout.  This is a zero-copy descriptor change used
+    by the Gluon CDNA4 transpose-read path: a row-major rank-3 physical image
+    is loaded by direct-to-LDS and then reinterpreted as a bank-aware rank-2 K
+    tile.  Without ``layout`` the source layout is preserved for compatibility.
     """
+    layout = tl._unwrap_if_constexpr(layout)
     if shape is None:
         shape = src.type.shape
     else:
         assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
             "TLX local_reinterpret with reshaping only supports SMEM")
 
+    encoding = None
+    if layout is not None:
+        assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
+            "TLX local_reinterpret with an explicit layout only supports SMEM")
+        encoding = layout.to_ir(_semantic.builder)
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
-                                                                              dtype.to_ir(_semantic.builder), shape)
+                                                                              dtype.to_ir(_semantic.builder), shape,
+                                                                              encoding)
+    result_layout = layout if layout is not None else src.type.layout
     return tlx.buffered_tensor(
         reinterpreted_value_handle,
         dtype,
         shape,
         src.type.num,
         src.type.storage,
-        src.type.layout,
+        result_layout,
     )
 
 
@@ -1147,7 +1264,7 @@ def _amd_tdm_descriptor_layout(desc):
     max_pad_interval = 256 * 32 // elem_width
     if pad_interval <= max_pad_interval:
         return tlx.padded_shared_layout_encoding.with_identity_for([(pad_interval, pad_amount)], block_shape, order)
-    return tlx.swizzled_shared_layout_encoding.make_default(rank=ndim)
+    return tlx.layout(tlx.swizzled_layout.make_default(rank=ndim))
 
 
 def _layouts_match(actual, expected):

@@ -5,6 +5,13 @@ from . import math
 from . import extra
 # Import TLX features (async_task, async_tasks) for backward compatibility
 from .extra.tlx import async_task, async_tasks
+from .clc import clc_tile_scheduler, ClcTileScheduler
+from .schedule import (
+    TileScheduler,
+    NonPersistentScheduler,
+    StaticPersistent1DScheduler,
+    DynamicPersistent1DScheduler,
+)
 from .standard import (
     argmax,
     argmin,
@@ -38,6 +45,7 @@ from .core import (
     TRITON_MAX_TENSOR_NUMEL,
     _experimental_descriptor_load,
     _experimental_descriptor_store,
+    aggregate_replace,
     load_tensor_descriptor,
     store_tensor_descriptor,
     make_tensor_descriptor,
@@ -127,6 +135,7 @@ from .core import (
     uint32,
     uint64,
     uint8,
+    expect_zero,
     view,
     void,
     where,
@@ -162,6 +171,7 @@ __all__ = [
     "tensor_descriptor",
     "abs",
     "add",
+    "aggregate_replace",
     "advance",
     "arange",
     "argmax",
@@ -170,6 +180,12 @@ __all__ = [
     "async_task",
     "async_tasks",
     "assume",
+    "clc_tile_scheduler",
+    "ClcTileScheduler",
+    "TileScheduler",
+    "NonPersistentScheduler",
+    "StaticPersistent1DScheduler",
+    "DynamicPersistent1DScheduler",
     "atomic_add",
     "atomic_and",
     "atomic_cas",
@@ -291,6 +307,7 @@ __all__ = [
     "uint32",
     "uint64",
     "uint8",
+    "expect_zero",
     "uint_to_uniform_float",
     "umulhi",
     "unsqueeze",

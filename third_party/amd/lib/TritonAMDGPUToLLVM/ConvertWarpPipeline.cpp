@@ -20,6 +20,7 @@
  * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+#include "Analysis/AMDGPUAllocation.h"
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
@@ -71,7 +72,7 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
         if (bufId == Allocation::InvalidBufferId)
           continue;
         auto interval = allocation->getAllocatedInterval(bufId);
-        auto slice = AllocationSlice(v, interval);
+        auto slice = AllocationSlice(v, interval, bufId);
         if (isa<MemoryEffects::Write>(eff.getEffect()))
           info.syncWriteSlices[slice].insert(op);
         else if (isa<MemoryEffects::Read>(eff.getEffect()))
@@ -931,21 +932,24 @@ struct ConvertWarpPipeline
     : public mlir::triton::impl::ConvertWarpPipelineBase<ConvertWarpPipeline> {
 
 public:
-  ConvertWarpPipeline(StringRef arch)
+  ConvertWarpPipeline(StringRef gfxArch)
       : ConvertWarpPipelineBase<ConvertWarpPipeline>() {
-    this->arch = arch.str();
+    this->gfxArch = gfxArch.str();
   }
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
-    mlir::triton::AMD::TargetInfo targetInfo(arch.getValue());
+    mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());
     size_t partitionSize = targetInfo.getSharedMemoryPartitionSize();
-    ModuleAllocation moduleAllocation(
-        m, triton::defaultAllocationAnalysisScratchSizeFn, partitionSize);
+    auto allocationFn = [&targetInfo](Operation *op) -> unsigned {
+      return mlir::triton::AMD::AMDAllocationAnalysisScratchSizeFn(op,
+                                                                   targetInfo);
+    };
+    ModuleAllocation moduleAllocation(m, allocationFn, partitionSize);
 
     if (targetInfo.getISAFamily() == mlir::triton::AMD::ISAFamily::Unknown) {
-      m.emitError("unsupported target: '") << arch.getValue() << "'";
+      m.emitError("unsupported target: '") << gfxArch.getValue() << "'";
       return signalPassFailure();
     }
     // Thread count of one warp-pipeline group.
@@ -996,7 +1000,7 @@ public:
 
 namespace mlir::triton::AMD {
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertWarpPipelinePass(StringRef arch) {
-  return std::make_unique<ConvertWarpPipeline>(arch);
+createConvertWarpPipelinePass(StringRef gfxArch) {
+  return std::make_unique<ConvertWarpPipeline>(gfxArch);
 }
 } // namespace mlir::triton::AMD

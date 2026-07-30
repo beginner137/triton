@@ -3,8 +3,8 @@
 
 //===----------------------------------------------------------------------===//
 // Edge case 0: Single-stage schedule (maxStage=0).
-// MMA-only loop: no TMA copy, no result use. With selfLatency=1,
-// II = 1 (single TC op) and the MMA lands at cycle 0, stage 0.
+// MMA-only loop: no TMA copy, no result use. With selfLatency=30,
+// II = 256 (single TC op) and the MMA lands at cycle 0, stage 0.
 //
 // Regression test for Devmate review: tt.num_stages must be set even when
 // maxStage = 0 so downstream pipelining recognises the loop as scheduled.
@@ -17,7 +17,7 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // Verify the maxStage=0 dump and the loop's tt.num_stages=1 attribute.
-// CHECK: ii = 1, max_stage = 0
+// CHECK: ii = 256, max_stage = 0
 // CHECK: @maxstage_0_mma_only
 // CHECK: tt.num_stages = 1 : i32
 tt.func @maxstage_0_mma_only(
@@ -88,14 +88,14 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-LABEL: @outer_loop_with_empty_inner
 // CHECK: tt.return
 tt.func @outer_loop_with_empty_inner(
-  %a_desc: !tt.tensordesc<tensor<128x64xf16>>
+  %a_desc: !tt.tensordesc<128x64xf16>
 ) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32
   %tiles = arith.constant 4 : i32
 
   scf.for %t = %c0_i32 to %tiles step %c1_i32 : i32 {
-    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
+    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
     %a_shared = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
     "test.use"(%a_shared) : (!ttg.memdesc<128x64xf16, #shared, #smem>) -> ()
 

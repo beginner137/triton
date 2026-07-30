@@ -13,7 +13,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Callable, Generic, Iterable, Optional, TypeVar, overload, Dict, Any, Tuple
+from typing import Callable, Concatenate, Generic, Iterable, Optional, ParamSpec, TYPE_CHECKING, TypeVar, overload, Dict, Any, Tuple
 
 from triton.backends import BaseBackend
 from types import ModuleType
@@ -27,6 +27,65 @@ try:
     from triton._C.libtriton import native_create_jit_proxy
 except ImportError:
     native_create_jit_proxy = None
+
+# --- dispatch/cache stats (opt-in via TRITON_CACHE_STATS=1) ------------------
+# Counts, per kernel, the outcome of the Python run() dispatch once a C proxy has
+# fallen back into Python (or for callable-grid / first-call cases). Combined with
+# the C-side proxy hit/fallback counters (native_dump_cache_stats), this gives a
+# per-path, per-kernel picture of where the C fast path is / isn't taken — so
+# owners can find kernels that silently miss it now that the flags default on.
+# Zero work when off: a single module-level bool checked at each count site.
+_CACHE_STATS_ON = os.environ.get("TRITON_CACHE_STATS", "0") == "1"
+_CACHE_STATS_PY: dict = {}  # kernel name -> {event: count}
+
+
+def _cache_stats_record(name: str, event: str) -> None:
+    # Callers must guard with `if _CACHE_STATS_ON`.
+    k = _CACHE_STATS_PY.get(name)
+    if k is None:
+        k = {}
+        _CACHE_STATS_PY[name] = k
+    k[event] = k.get(event, 0) + 1
+
+
+def dump_cache_stats() -> dict:
+    """Merged {kernel: {event: count}} of C proxy + Python run() dispatch stats.
+
+    Enable collection with TRITON_CACHE_STATS=1. Events:
+      autotune_proxy_hit / autotune_proxy_fallback  (C, autotuned kernels)
+      jit_proxy_hit / jit_proxy_fallback            (C, bare kernels)
+      run_fast_hit_c / run_fast_py_fallback         (Python run() fast path)
+      run_slow_c / run_slow_py_fallback             (Python run() slow path)
+    """
+    merged: dict = {}
+    try:
+        from triton._C.libtriton import native_dump_cache_stats
+        for kname, events in native_dump_cache_stats().items():
+            merged.setdefault(kname, {}).update(events)
+    except (ImportError, AttributeError):
+        pass
+    for kname, events in _CACHE_STATS_PY.items():
+        dst = merged.setdefault(kname, {})
+        for ev, n in events.items():
+            dst[ev] = dst.get(ev, 0) + n
+    return merged
+
+
+if _CACHE_STATS_ON:
+    import atexit as _atexit
+
+    @_atexit.register
+    def _dump_cache_stats_atexit() -> None:
+        stats = dump_cache_stats()
+        if not stats:
+            return
+        import sys as _sys
+        print("[TRITON_CACHE_STATS] per-kernel dispatch hit/fallback:", file=_sys.stderr, flush=True)
+        for kname in sorted(stats):
+            events = stats[kname]
+            summary = ", ".join(f"{ev}={events[ev]}" for ev in sorted(events))
+            print(f"  {kname}: {summary}", file=_sys.stderr, flush=True)
+
 
 # Fast tensor access API — lazily registered on first use.
 # Provides ~10x faster dtype/data_ptr extraction via direct C struct access.
@@ -72,6 +131,9 @@ GLUON_MODULE = "triton.experimental.gluon.language"
 INDENT_PATTERN = re.compile(r"^(?P<indent>[ \t]*)def\s+\w+\s*\(", re.MULTILINE)
 
 T = TypeVar("T")
+P = ParamSpec("P")
+R = TypeVar("R")
+U = TypeVar("U")
 
 # -----------------------------------------------------------------------------
 # Dependencies Finder
@@ -137,14 +199,9 @@ class DependenciesFinder(ast.NodeVisitor):
     def ret(self):
         return self.hasher.hexdigest()
 
-    def _is_triton_builtin(self, node, func):
-        if inspect.isbuiltin(node.func):
-            return True
-        module = getattr(func, "__module__", "")
-        return module.startswith(TRITON_MODULE)
-
     def _update_hash(self, func):
         assert isinstance(func, JITCallable)
+        func_key = func.cache_key
         # Merge our used_global_vals with those of the called function,
         # after checking that all overlapping values are consistent.
         for k in self.used_global_vals.keys() & func.used_global_vals.keys():
@@ -157,7 +214,6 @@ class DependenciesFinder(ast.NodeVisitor):
                 )
         self.used_global_vals.update(func.used_global_vals)
         # update hash
-        func_key = func.cache_key
         func_key += str(getattr(func, "noinline", False))
         self.hasher.update(func_key.encode("utf-8"))
 
@@ -237,7 +293,7 @@ class DependenciesFinder(ast.NodeVisitor):
         lhs_name = getattr(lhs, "__name__", "")
         if lhs is None or lhs_name in self.supported_modules:
             return None
-        ret = getattr(lhs, node.attr)
+        ret = getattr(lhs, node.attr, None)
         self.record_reference(ret)
         return ret
 
@@ -279,13 +335,17 @@ class DependenciesFinder(ast.NodeVisitor):
         visit_defaults(node.defaults)
 
     def visitAssnTarget(self, node):
-        # Target is either a single string, or a list of strings (if the assn
-        # target is a tuple).
+        # Target is either a single string, or a (possibly nested) list of strings if the assign target is a tuple.
         target = self.visit(node)
-        if isinstance(target, list):
-            self.local_names |= set(target)
-        else:
-            self.local_names.add(target)
+
+        def _add(t):
+            if isinstance(t, list):
+                for sub in t:
+                    _add(sub)
+            else:
+                self.local_names.add(t)
+
+        _add(target)
 
     def visit_Assign(self, node):
         if len(node.targets) != 1:
@@ -418,8 +478,21 @@ class KernelInterface(Generic[T]):
         # Fast C proxy: bypasses Python run() entirely for cache hits.
         # Only useful when dispatcher is available — without it the proxy
         # does a redundant C cache lookup then falls back to run() anyway.
+        #
+        # Skip the proxy when the kernel reads module-level globals: the C proxy
+        # launches a cache hit without re-validating used_global_vals, so a
+        # changed global would be silently ignored. Routing such kernels through
+        # run() preserves the "Global variable ... has changed" RuntimeError.
+        #
+        # Also skip it whenever run() would do per-launch work the proxy bypasses
+        # — launch hooks, pre-run hooks, launch_metadata, or a stages-inspection
+        # hook — so those still fire (mirrors the run() c_cache fast-path guard).
         if native_create_jit_proxy is not None and getattr(self, 'c_cache', False) \
                 and knobs.nvidia.use_triton_dispatcher \
+                and not self.used_global_vals \
+                and not self.pre_run_hooks and not self.launch_metadata \
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
+                and knobs.runtime.add_stages_inspection_hook is None \
                 and not callable(grid) and hasattr(self, '_fc_options_hash') and hasattr(self, 'params'):
             cache = getattr(self, '_jit_proxy_cache', None)
             if cache is None:
@@ -607,9 +680,11 @@ class JITCallable:
             self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))
 
             from triton.language.core import constexpr
-            self.hash += str([(name, val)
-                              for (name, _), (val, _) in self.used_global_vals.items()
-                              if isinstance(val, constexpr)])
+            constexpr_globals = [(name, val)
+                                 for (name, _), (val, _) in self.used_global_vals.items()
+                                 if isinstance(val, constexpr)]
+            constexpr_globals.sort(key=lambda item: (item[0], repr(item[1])))
+            self.hash += str(constexpr_globals)
             self.hash = hashlib.sha256(self.hash.encode("utf-8")).hexdigest()
         return self.hash
 
@@ -700,6 +775,41 @@ def convert_to_tuple_if_list(item):
         item[i] = convert_to_tuple_if_list(nested_value)
 
     return tuple(item)
+
+
+class _DeviceCaches(defaultdict):
+    """defaultdict of per-device compiled-kernel caches that also invalidates the
+    C fast caches (JITCacheProxy cache + native FastCache) when cleared.
+
+    The C fast cache mirrors the compiled kernels held here, so callers that
+    clear the in-memory device caches to force a re-fetch/recompile (e.g. tests
+    exercising the disk cache + compilation listener) must not be silently
+    short-circuited by a stale C cache entry. Keeps the two caches consistent.
+    """
+
+    def __init__(self, jit_fn, default_factory):
+        super().__init__(default_factory)
+        self._jit_fn = jit_fn
+
+    def __reduce__(self):
+        # Return an EMPTY defaultdict for pickling/deepcopy.  The compiled
+        # kernels inside this cache contain _TritonDispatcher C objects whose
+        # kernel_params are interior pointers into arg_storage — deep-copying
+        # them produces dangling pointers and crashes.  An empty cache is fine
+        # for snapshots (e.g. torch._inductor's TritonBundler.deepcopy).
+        return (defaultdict, ())
+
+    def clear(self):
+        super().clear()
+        jit_fn = self._jit_fn
+        proxy_cache = getattr(jit_fn, "_jit_proxy_cache", None)
+        if proxy_cache is not None:
+            proxy_cache.clear()
+        # Drop the native FastCache capsule so it is recreated empty on next use.
+        try:
+            del jit_fn._fc_cache
+        except AttributeError:
+            pass
 
 
 class JITFunction(JITCallable, KernelInterface[T]):
@@ -838,7 +948,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # NOTE: This block is only reached when JITCacheProxy cannot be used
         # (callable grid, first call, or C extension unavailable).
         # Static-grid repeat calls go through JITCacheProxy directly.
-        if not _skip_fc and self.c_cache and not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile \
+        if not _skip_fc and self.c_cache and not warmup \
+                and not self.pre_run_hooks and not knobs.compilation.always_compile \
+                and not self.used_global_vals \
                 and knobs.runtime.add_stages_inspection_hook is None \
                 and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
                 and not self.launch_metadata:
@@ -894,6 +1006,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     if _globals_ok:
                         kernel = result
                         if not getattr(kernel, '_dispatcher', None):
+                            if _CACHE_STATS_ON:
+                                _cache_stats_record(self._fn_name, "run_fast_py_fallback")
                             if knobs.nvidia.use_triton_dispatcher:
                                 warnings.warn(
                                     f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C "
@@ -906,6 +1020,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
                             grid_2 = _fc_grid[2] if grid_size > 2 else 1
                             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, None,
                                        None, None, *_fc_args)
+                        elif _CACHE_STATS_ON:
+                            _cache_stats_record(self._fn_name, "run_fast_hit_c")
                         return kernel
         elif not _skip_fc and self.c_cache and not warmup:
             reasons = []
@@ -972,7 +1088,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # where signature/constexprs are in scope. Never affects the user run.
             if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
                 try:
-                    from triton.compile_iq.collector import capture as _ciq_capture
+                    from triton.magnon.collector import capture as _ciq_capture
                     _ck = kernel.result() if hasattr(kernel, "result") else kernel
                     _cg = grid(bound_args) if callable(grid) else grid
                     _ciq_capture(jitfn=self, kernel=_ck, bound_args=bound_args, signature=signature,
@@ -1010,6 +1126,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
+            # Ensure module/function handles and the C dispatcher are built before we
+            # read `_dispatcher` below. Without this, the plain run path reads
+            # `_dispatcher` before `_init_handles()` (called lazily inside kernel.run)
+            # has built it, so TRITON_USE_C_DISPATCHER never engages on this path.
+            # `_init_handles` is idempotent (early-returns once module is loaded).
+            if hasattr(kernel, "_init_handles"):
+                kernel._init_handles()
             # compile_iq free-win: if a tuned ACF candidate is pending, run the one-shot plain-vs-ACF
             # competition with the real args before launching, and keep the winner (no-op/near-zero
             # cost otherwise; suppressed while the autotuner is benchmarking). Read _disp afterward so
@@ -1021,10 +1144,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # when available and hooks are not needed.
             _disp = getattr(kernel, '_dispatcher', None)
             if _disp is not None and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook:
+                if _CACHE_STATS_ON:
+                    _cache_stats_record(self._fn_name, "run_slow_c")
                 _vals = tuple(bound_args.values())
                 _indices = kernel._dispatch_arg_indices
                 _disp(grid_0, grid_1, grid_2, stream, *[_vals[i] for i in _indices])
             else:
+                if _CACHE_STATS_ON:
+                    _cache_stats_record(self._fn_name, "run_slow_py_fallback")
                 if knobs.nvidia.use_triton_dispatcher and _disp is None:
                     warnings.warn(
                         f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
@@ -1067,7 +1194,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         return self._fn_name if self._repr is None else self._repr(_)
 
     def __init__(self, fn, version=None, do_not_specialize=None, do_not_specialize_on_alignment=None, debug=None,
-                 noinline=None, repr=None, launch_metadata=None, c_cache=False):
+                 noinline=None, repr=None, launch_metadata=None, c_cache=None):
         do_not_specialize = do_not_specialize if do_not_specialize else []
         do_not_specialize_on_alignment = do_not_specialize_on_alignment if do_not_specialize_on_alignment else []
 
@@ -1078,7 +1205,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self._repr = repr
         self.launch_metadata = launch_metadata
-        self.c_cache = c_cache or (os.environ.get("TRITON_ENABLE_C_CACHE", "0") == "1")
+        # C cache defaults ON (opt out with TRITON_ENABLE_C_CACHE=0). An explicit
+        # c_cache=True/False on @triton.jit always wins over the env default;
+        # c_cache=None (not specified) falls back to the env-controlled default.
+        if c_cache is None:
+            self.c_cache = knobs.nvidia.enable_c_cache
+        else:
+            self.c_cache = c_cache
         if self.c_cache:
             _ensure_torch_bridge()
         # Register for simple deserialization of JITFunction constants
@@ -1091,7 +1224,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             self.params.append(KernelParam(i, param, dns, dns_oa))
 
         # cache of just-in-time compiled kernels
-        self.device_caches = defaultdict(self.create_binder)
+        self.device_caches = _DeviceCaches(self, self.create_binder)
 
         # Options hash for C fast dispatch cache.
         # Constant 0: kernel options (num_warps, num_stages, etc.) are fixed
@@ -1198,8 +1331,22 @@ class JITFunction(JITCallable, KernelInterface[T]):
                             [attrs], warmup)
         return kernel
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self: "JITFunction[Callable[P, R]]", *args: P.args, **kwargs: P.kwargs) -> R:
         raise RuntimeError("Cannot call @triton.jit'd outside of the scope of a kernel")
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __get__(self, instance: None, owner: Optional[type] = None) -> "JITFunction[T]":
+            ...
+
+        @overload
+        def __get__(self: "JITFunction[Callable[Concatenate[U, P], R]]", instance: Any,
+                    owner: Optional[type] = None) -> Callable[P, R]:
+            ...
+
+        def __get__(self, instance, owner=None):
+            ...
 
     def __repr__(self):
         return f"JITFunction({self.module}:{self.fn.__qualname__})"
@@ -1225,7 +1372,7 @@ def jit(
     do_not_specialize_on_alignment: Optional[Iterable[int | str]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
-    c_cache: bool = False,
+    c_cache: Optional[bool] = None,
 ) -> Callable[[T], JITFunction[T]]:
     ...
 
@@ -1240,7 +1387,7 @@ def jit(
     do_not_specialize_on_alignment: Optional[Iterable[int | str]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
-    c_cache: bool = False,
+    c_cache: Optional[bool] = None,
 ) -> KernelInterface[T]:
     """
     Decorator for JIT-compiling a function using the Triton compiler.
@@ -1417,7 +1564,7 @@ class BoundConstexprFunction(JITCallable):
         return self.__func__(self.__self__, *args, **kwargs)
 
 
-class ConstexprFunction(JITCallable):
+class ConstexprFunction(JITCallable, Generic[T]):
 
     def __init__(self, fn):
         super().__init__(fn)
@@ -1427,6 +1574,10 @@ class ConstexprFunction(JITCallable):
         if obj is not None:
             return BoundConstexprFunction(obj, self)
         return self
+
+    @overload
+    def __call__(self: "ConstexprFunction[Callable[P, R]]", *args: P.args, **kwargs: P.kwargs) -> R:
+        ...
 
     def __call__(self, *args, _semantic=None, **kwargs):
         from triton.language.core import _unwrap_if_constexpr, constexpr
@@ -1447,7 +1598,7 @@ class ConstexprFunction(JITCallable):
         return constexpr(res)
 
 
-def constexpr_function(fn):
+def constexpr_function(fn: T) -> ConstexprFunction[T]:
     """
     Wraps an arbitrary Python function so that it can be called at
     compile-time on constexpr arguments in a Triton function and

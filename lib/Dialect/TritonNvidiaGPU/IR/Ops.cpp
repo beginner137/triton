@@ -41,6 +41,7 @@
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir::triton::gpu;
 
@@ -171,13 +172,6 @@ bool WarpGroupDotOp::needsPartialAccumulator() {
   return isFP8 && accFP32 && maxNumImpreciseAcc <= aTensorTy.getShape()[1];
 }
 
-bool WarpGroupDotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 // -- WarpGroupDotWaitOp --
 LogicalResult WarpGroupDotWaitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
@@ -200,6 +194,14 @@ LogicalResult InitBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  auto barrierTy = cast<MemDescType>(getAlloc().getType());
+  // We cannot place cluster barriers inside warp-specialize regions, and we
+  // need to place a relaxed cluster barrier between barrier.init and the first
+  // barrier use.
+  bool crossCTA = barrierTy.getShape()[0] != gpu::lookupNumCTAs(getOperation());
+  if (crossCTA &&
+      getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
+    return emitOpError("cannot be used inside `ttg.warp_specialize`");
   return success();
 }
 
@@ -258,11 +260,39 @@ LogicalResult BarrierExpectOp::verify() {
   return success();
 }
 
+Value BarrierExpectOp::getPredicateOperand() { return getPred(); }
+
+void BarrierExpectOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+
+Type BarrierExpectOp::getPredicateOperandTypeLike() {
+  return getPred().getType();
+}
+
 // -- WaitBarrierOp --
 LogicalResult WaitBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
     return failure();
   return success();
+}
+
+// Forward declaration. The single (beta-adapted) definition lives below near
+// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so
+// we keep that version rather than the upstream hard-failing one this
+// cherry-pick carried.
+static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
+                                            CGAEncodingAttr expectedCGALayout,
+                                            StringRef barrierName);
+
+Value WaitBarrierOp::getPredicateOperand() { return getPred(); }
+
+void WaitBarrierOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+
+Type WaitBarrierOp::getPredicateOperandTypeLike() {
+  return IntegerType::get(getContext(), 1);
 }
 
 // -- ArriveBarrierOp --
@@ -271,7 +301,31 @@ LogicalResult ArriveBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  if (isMulticast()) {
+    if (getPerThread())
+      return emitOpError("multicast arrive does not support perThread");
+    int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+    if (numCTAs <= 1)
+      return emitOpError("multicast arrive requires num_ctas > 1");
+    if (getCtaMask() > static_cast<uint32_t>(numCTAs - 1))
+      return emitOpError("ctaMask exceeds numCTAs - 1");
+    auto expectedCGALayout =
+        CGAEncodingAttr::get1DLayout(getContext(), numCTAs);
+    if (failed(verifyBarrierCGALayout(*this, getAlloc(), expectedCGALayout,
+                                      "multicast barrier")))
+      return failure();
+  }
   return success();
+}
+
+Value ArriveBarrierOp::getPredicateOperand() { return getPred(); }
+
+void ArriveBarrierOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+
+Type ArriveBarrierOp::getPredicateOperandTypeLike() {
+  return IntegerType::get(getContext(), 1);
 }
 
 // -- VoteBallotSyncOp --
@@ -329,14 +383,82 @@ LogicalResult VoteBallotSyncOp::verify() {
 
   return success();
 }
-
 // -- TMA operation verifiers --
+static std::string formatCGALayout(CGAEncodingAttr cgaLayout) {
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  auto kBlock = StringAttr::get(cgaLayout.getContext(), "block");
+  os << "[";
+  llvm::interleaveComma(cgaLayout.getLinearLayout().getBases().lookup(kBlock),
+                        os, [&](const auto &basis) {
+                          os << "[";
+                          llvm::interleaveComma(basis, os);
+                          os << "]";
+                        });
+  os << "]";
+  return os.str();
+}
+
+static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
+                                            CGAEncodingAttr expectedCGALayout,
+                                            StringRef barrierName) {
+  auto barrierTy = cast<MemDescType>(barrier.getType());
+  auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
+  // beta divergence: beta's TMA kernels commonly leave the barrier CGA layout
+  // unset (empty block bases = the default single-CTA layout) rather than
+  // spelling out the explicit form upstream emits. Treat an unset layout as
+  // satisfying the expectation instead of hard-failing (mirrors
+  // verifyTMAEncoding's skip-when-no-encoding behavior below). This keeps the
+  // check meaningful for barriers that DO carry an explicit CGA layout.
+  auto kBlock = StringAttr::get(op->getContext(), "block");
+  if (actualCGALayout.getLinearLayout().getBases().lookup(kBlock).empty())
+    return success();
+  if (actualCGALayout != expectedCGALayout)
+    return op->emitOpError() << barrierName << " cga_layout must be "
+                             << formatCGALayout(expectedCGALayout) << ", got "
+                             << formatCGALayout(actualCGALayout);
+  return success();
+}
+
+static LogicalResult verifyTMABarrierLayout(Operation *op, Value barrier) {
+  auto twoCTAsAttr =
+      op->getParentOfType<ModuleOp>()->getAttrOfType<BoolAttr>(AttrTwoCTAsName);
+  if (!twoCTAsAttr)
+    return success();
+
+  auto ctx = op->getContext();
+  int numCTAs = gpu::lookupNumCTAs(op);
+  auto barrierTy = cast<MemDescType>(barrier.getType());
+  auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
+  auto oneCTACGALayout = CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  if (actualCGALayout == oneCTACGALayout)
+    return success();
+
+  if (twoCTAsAttr.getValue()) {
+    auto kBlock = StringAttr::get(ctx, "block");
+    auto dim = standardOutDimNames(ctx, /*rank=*/1)[0];
+    auto layout = LinearLayout::zeros1D(2, kBlock, dim) *
+                  LinearLayout::identity1D(numCTAs / 2, kBlock, dim);
+    auto twoCTACGALayout = CGAEncodingAttr::get(ctx, std::move(layout));
+    if (actualCGALayout == twoCTACGALayout)
+      return success();
+    return op->emitOpError() << "TMA barrier cga_layout must be "
+                             << formatCGALayout(oneCTACGALayout) << " or "
+                             << formatCGALayout(twoCTACGALayout) << ", got "
+                             << formatCGALayout(actualCGALayout);
+  }
+
+  return op->emitOpError() << "TMA barrier cga_layout must be "
+                           << formatCGALayout(oneCTACGALayout) << ", got "
+                           << formatCGALayout(actualCGALayout);
+}
+
 static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
                                        Attribute enc) {
   auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(enc);
   if (!nvmma)
     return op->emitOpError("TMA descriptor must have NVMMA shared layout");
-  auto descBlockEnc = desc.getBlockType().getEncoding();
+  auto descBlockEnc = desc.getSharedLayout();
   // If the descriptor has no encoding yet (e.g., before
   // optimize-descriptor-encoding pass), skip the match check.
   if (descBlockEnc) {
@@ -362,6 +484,8 @@ static LogicalResult verifyAsyncTMALoadOp(Operation *op,
                                           TypedValue<MemDescType> barrier,
                                           MemDescType resultType) {
   if (failed(verifyBarrierType(op, barrier.getType())))
+    return failure();
+  if (failed(verifyTMABarrierLayout(op, barrier)))
     return failure();
   if (!resultType.getMutableMemory())
     return op->emitOpError("cannot store into immutable memory");
@@ -389,7 +513,7 @@ static bool isIm2ColDescriptor(Type descType) {
 static LogicalResult verifyAsyncTMACoords(Operation *op, ValueRange coords,
                                           TensorDescInterface desc,
                                           bool isIm2Col) {
-  unsigned blockRank = desc.getBlockType().getRank();
+  unsigned blockRank = desc.getShape().size();
 
   if (isIm2Col) {
     // For IM2COL mode, coordinates are for the full tensor (3D-5D)
@@ -462,6 +586,32 @@ static LogicalResult verifyTMAMode(Operation *op, TensorMode tensorMode,
   return success();
 }
 
+bool AsyncTMAReduceOp::isSupportedReduceKind(DescriptorReduceKind kind,
+                                             Type elementType) {
+  bool isInt32 = elementType.isInteger(32);
+  bool isInt32Or64 = isInt32 || elementType.isInteger(64);
+  bool isNotSignedInt64 =
+      elementType.isInteger(64) && !elementType.isSignedInteger();
+  bool isF16OrBF16 = elementType.isF16() || elementType.isBF16();
+  switch (kind) {
+  case DescriptorReduceKind::ADD:
+    return isInt32 || isNotSignedInt64 || elementType.isF32() || isF16OrBF16;
+  case DescriptorReduceKind::MIN:
+  case DescriptorReduceKind::MAX:
+    return isInt32Or64 || isF16OrBF16;
+  case DescriptorReduceKind::AND:
+  case DescriptorReduceKind::OR:
+  case DescriptorReduceKind::XOR:
+    return isInt32Or64;
+  case DescriptorReduceKind::INC:
+  case DescriptorReduceKind::DEC:
+    return false;
+  case DescriptorReduceKind::NONE:
+    break;
+  }
+  llvm_unreachable("unexpected reduce kind for async_tma_reduce");
+}
+
 // -- AsyncTMACopyGlobalToLocalOp --
 LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
   auto descType = getDesc().getType();
@@ -480,7 +630,20 @@ LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
                            isIm2Col ? TensorMode::IM2COL : TensorMode::TILED,
                            getCoord(), getOffsets())))
     return failure();
+  if (getMulticast() && !getMulticastTargets() && !hasCGABroadcast(resultType))
+    return emitOpError(
+        "multicast requires the shared layout to broadcast across CTAs");
   return success();
+}
+
+Value AsyncTMACopyGlobalToLocalOp::getPredicateOperand() { return getPred(); }
+
+void AsyncTMACopyGlobalToLocalOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+
+Type AsyncTMACopyGlobalToLocalOp::getPredicateOperandTypeLike() {
+  return getPred().getType();
 }
 
 // -- AsyncTMACopyLocalToGlobalOp --
@@ -504,7 +667,14 @@ LogicalResult AsyncTMAReduceOp::verify() {
   MemDescType srcType = getSrc().getType();
   if (failed(verifyDescriptorLoadStoreOp(*this, getDesc().getType(), srcType)))
     return failure();
-  return verifyAsyncTMAStoreOp(*this, getDesc(), srcType);
+  if (failed(verifyAsyncTMAStoreOp(*this, getDesc(), srcType)))
+    return failure();
+  Type elementType = getDesc().getType().getBlockType().getElementType();
+  if (!isSupportedReduceKind(getKind(), elementType))
+    return emitOpError("unsupported reduce kind ")
+           << stringifyDescriptorReduceKind(getKind()) << " for element type "
+           << elementType;
+  return success();
 }
 
 // -- AsyncTMAGatherOp --
@@ -519,6 +689,16 @@ LogicalResult AsyncTMAGatherOp::verify() {
   return verifyGatherScatterOp(*this,
                                getDesc().getType().getSignlessBlockType(),
                                resultType, getXOffsets().getType());
+}
+
+Value AsyncTMAGatherOp::getPredicateOperand() { return getPred(); }
+
+void AsyncTMAGatherOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+
+Type AsyncTMAGatherOp::getPredicateOperandTypeLike() {
+  return getPred().getType();
 }
 
 // -- AsyncTMAScatter --
@@ -648,6 +828,19 @@ static LogicalResult verifyMMADType(Operation *op, Type a, Type b, Type d) {
   return success();
 }
 
+static LogicalResult verifyCompletionBarrierLayout(Operation *op,
+                                                   Value barrier) {
+  auto barrierTy = cast<MemDescType>(barrier.getType());
+  auto expectedCGALayout =
+      CGAEncodingAttr::get1DLayout(op->getContext(), gpu::lookupNumCTAs(op));
+  auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
+  if (actualCGALayout != expectedCGALayout)
+    return op->emitOpError("completion barrier cga_layout must be ")
+           << formatCGALayout(expectedCGALayout) << ", got "
+           << formatCGALayout(actualCGALayout);
+  return success();
+}
+
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -660,6 +853,8 @@ LogicalResult TCGen5MMAOp::verify() {
     // #9474) does not understand. Only verify the rank-1 form; leave beta's
     // higher-rank barriers unchecked here as they were before #9474.
     if (barrierTy.getRank() == 1 && failed(verifyBarrierType(*this, barrierTy)))
+      return failure();
+    if (failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
       return failure();
   }
   Type atype = getA().getType().getElementType();
@@ -771,13 +966,9 @@ void TCGen5MMAOp::getEffects(
   }
   effects.emplace_back(MemoryEffects::Read::get(), &getBMutable(),
                        SharedMemory::get());
-}
-
-bool TCGen5MMAOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
+  for (auto &barrierMutable : getBarriersMutable())
+    effects.emplace_back(MemoryEffects::Write::get(), &barrierMutable,
+                         SharedMemory::get());
 }
 
 bool TCGen5MMAOp::verifyOutputDims() {
@@ -811,6 +1002,21 @@ void TCGen5MMAOp::setUseAccumulator(Value flag) {
 ValueRange TCGen5MMAOp::getCompletionBarriers() { return getBarriers(); }
 ValueRange TCGen5MMAOp::getCompletionBarrierPreds() {
   return getBarrierPreds();
+}
+
+static void appendMulticastDesc(SmallVectorImpl<Value> &descs,
+                                TypedValue<MemDescType> desc) {
+  if (isa<SharedEncodingTrait>(desc.getType().getEncoding()))
+    descs.push_back(desc);
+}
+
+SmallVector<Value> TCGen5MMAOp::getCompletionDescs() {
+  SmallVector<Value> descs;
+  if (getMulticast()) {
+    appendMulticastDesc(descs, getA());
+    appendMulticastDesc(descs, getB());
+  }
+  return descs;
 }
 
 void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
@@ -857,6 +1063,12 @@ Value TCGen5MMAOp::getPredicate() { return getPred(); }
 
 void TCGen5MMAOp::setPredicate(Value pred) { getPredMutable().assign(pred); }
 
+Value TCGen5MMAOp::getPredicateOperand() { return getPredicate(); }
+
+void TCGen5MMAOp::setPredicateOperand(Value pred) { setPredicate(pred); }
+
+Type TCGen5MMAOp::getPredicateOperandTypeLike() { return getPred().getType(); }
+
 void TCGen5MMAOp::build(OpBuilder &builder, OperationState &state, Type token,
                         Value a, Value b, Value d, Value accDep, Value useD,
                         Value pred, bool twoCtas, bool multicast,
@@ -877,12 +1089,24 @@ bool TCGen5MMAOp::isAsync() { return getIsAsync(); }
 // -- TCGen5CommitOp --
 LogicalResult TCGen5CommitOp::verify() {
   auto numDescs = getDescs().size();
-  if (numDescs > 2)
-    return emitOpError("expected 0, 1, or 2 descriptors, got ") << numDescs;
+  if (numDescs > 4)
+    return emitOpError("expected 0 to 4 descriptors, got ") << numDescs;
   auto barrierTy = getBarrier().getType();
   if (failed(verifyBarrierType(*this, barrierTy)))
     return failure();
+  if (failed(verifyCompletionBarrierLayout(getOperation(), getBarrier())))
+    return failure();
   return success();
+}
+
+Value TCGen5CommitOp::getPredicateOperand() { return getPred(); }
+
+void TCGen5CommitOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+
+Type TCGen5CommitOp::getPredicateOperandTypeLike() {
+  return IntegerType::get(getContext(), 1);
 }
 
 // -- TCGen5MMAScaledOp --
@@ -911,7 +1135,39 @@ static Type getScaledMMAOperandType(Type elementType,
   llvm_unreachable("Unsupported type.");
 };
 
+static LogicalResult
+verifyScaleBlockRepOrder(TCGen5MMAScaledOp op,
+                         TensorMemoryScalesEncodingAttr encoding, bool isA) {
+  auto aScaleType = cast<MemDescType>(op.getAScale().getType());
+  auto bScaleType = cast<MemDescType>(op.getBScale().getType());
+  auto expectedOrder = getTensorMemoryScalesBlockRepOrder(
+      op.getOperation(), isA, op.getAType(), op.getBType(),
+      aScaleType.getElementType(), bScaleType.getElementType());
+  if (encoding.getBlockRepOrder() != expectedOrder) {
+    StringRef operandName = isA ? "A" : "B";
+    StringRef expectedOrderName =
+        expectedOrder == TensorMemoryScalesBlockRepOrder::K_THEN_MN ? "kThenMn"
+                                                                    : "mnThenK";
+    return op.emitOpError()
+           << operandName
+           << " scales in tensor memory must use "
+              "#ttng.tensor_memory_scales_encoding<blockRepOrder = "
+           << expectedOrderName << ">";
+  }
+  return success();
+}
+
 LogicalResult TCGen5MMAScaledOp::verify() {
+  if (!getIsAsync() && !getBarriers().empty()) {
+    return emitOpError("The op is synchronous but a barrier is present.");
+  }
+  for (auto barrier : getBarriers()) {
+    auto barrierTy = cast<MemDescType>(barrier.getType());
+    if (failed(verifyBarrierType(*this, barrierTy)))
+      return failure();
+    if (failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
+      return failure();
+  }
   Type atype =
       getScaledMMAOperandType(getA().getType().getElementType(), getAType());
   Type btype =
@@ -926,6 +1182,35 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   }
   if (enc.getBlockM() != 128)
     return emitOpError("only supports instruction shape blockM=128");
+  auto aScaleType = cast<MemDescType>(getAScale().getType());
+  auto bScaleType = cast<MemDescType>(getBScale().getType());
+  auto isScaleBlockRepOrderRelevant = [](MemDescType scaleType) {
+    auto shapePerCTA = getShapePerCTA(scaleType);
+    assert(shapePerCTA.size() >= 2);
+    int64_t rowsPerCTA = shapePerCTA[shapePerCTA.size() - 2];
+    int64_t scalesPerCTA = shapePerCTA.back();
+    return rowsPerCTA > 128 && scalesPerCTA > 4;
+  };
+  if (isa<TensorMemorySpaceAttr>(aScaleType.getMemorySpace()) &&
+      isScaleBlockRepOrderRelevant(aScaleType)) {
+    auto encoding =
+        dyn_cast<TensorMemoryScalesEncodingAttr>(aScaleType.getEncoding());
+    if (!encoding)
+      return emitOpError("A scales in tensor memory must use "
+                         "#ttng.tensor_memory_scales_encoding");
+    if (failed(verifyScaleBlockRepOrder(*this, encoding, /*isA=*/true)))
+      return failure();
+  }
+  if (isa<TensorMemorySpaceAttr>(bScaleType.getMemorySpace()) &&
+      isScaleBlockRepOrderRelevant(bScaleType)) {
+    auto encoding =
+        dyn_cast<TensorMemoryScalesEncodingAttr>(bScaleType.getEncoding());
+    if (!encoding)
+      return emitOpError("B scales in tensor memory must use "
+                         "#ttng.tensor_memory_scales_encoding");
+    if (failed(verifyScaleBlockRepOrder(*this, encoding, /*isA=*/false)))
+      return failure();
+  }
   return success();
 }
 
@@ -955,6 +1240,9 @@ void TCGen5MMAScaledOp::getEffects(
                        TensorMemory::get());
   effects.emplace_back(MemoryEffects::Read::get(), &getBScaleMutable(),
                        TensorMemory::get());
+  for (auto &barrierMutable : getBarriersMutable())
+    effects.emplace_back(MemoryEffects::Write::get(), &barrierMutable,
+                         SharedMemory::get());
 }
 
 bool TCGen5MMAScaledOp::verifyDims() {
@@ -1026,6 +1314,17 @@ ValueRange TCGen5MMAScaledOp::getCompletionBarrierPreds() {
   return getBarrierPreds();
 }
 
+SmallVector<Value> TCGen5MMAScaledOp::getCompletionDescs() {
+  SmallVector<Value> descs;
+  if (getMulticast()) {
+    appendMulticastDesc(descs, getA());
+    appendMulticastDesc(descs, getB());
+    appendMulticastDesc(descs, getAScale());
+    appendMulticastDesc(descs, getBScale());
+  }
+  return descs;
+}
+
 void TCGen5MMAScaledOp::addCompletionBarrier(Value barrier, Value pred) {
   getBarrierPredsMutable().append(pred);
   getBarriersMutable().append(barrier);
@@ -1041,6 +1340,14 @@ Value TCGen5MMAScaledOp::getPredicate() { return getPred(); }
 
 void TCGen5MMAScaledOp::setPredicate(Value pred) {
   getPredMutable().assign(pred);
+}
+
+Value TCGen5MMAScaledOp::getPredicateOperand() { return getPredicate(); }
+
+void TCGen5MMAScaledOp::setPredicateOperand(Value pred) { setPredicate(pred); }
+
+Type TCGen5MMAScaledOp::getPredicateOperandTypeLike() {
+  return getPred().getType();
 }
 
 int64_t TCGen5MMAScaledOp::getBlockM() {
@@ -1088,7 +1395,7 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
                               ScaleDotElemType aType, ScaleDotElemType bType,
                               Value useD, Value pred, bool twoCTAs,
                               ValueRange barriers, ValueRange barrierPreds,
-                              bool isAsync) {
+                              bool isAsync, bool multicast) {
   MLIRContext *ctx = builder.getContext();
   if (!barriers.empty()) {
     isAsync = true;
@@ -1097,7 +1404,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
         ScaleDotElemTypeAttr::get(ctx, aType),
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
-        twoCTAs ? builder.getUnitAttr() : UnitAttr());
+        twoCTAs ? builder.getUnitAttr() : UnitAttr(),
+        multicast ? builder.getUnitAttr() : UnitAttr());
 }
 
 bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
@@ -1162,6 +1470,14 @@ LogicalResult TMEMStoreOp::verify() {
                                           getDst().getType());
 }
 
+Value TMEMStoreOp::getPredicateOperand() { return getPred(); }
+
+void TMEMStoreOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+
+Type TMEMStoreOp::getPredicateOperandTypeLike() { return getPred().getType(); }
+
 // -- TMEMLoadOp --
 LogicalResult TMEMLoadOp::verify() {
   if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
@@ -1200,28 +1516,10 @@ LogicalResult TMEMLoadOp::verify() {
 
   // Validate reduction conditions
   if (redOp) {
-    auto regTy = getType();
-    auto memTy = getSrc().getType();
     auto maxnreg = getContextualMaxNReg(*this);
-    auto encodingInfoOr = computeTMemLdStEncodingInfo(regTy, memTy, maxnreg);
-    if (failed(encodingInfoOr))
-      return emitOpError("failed to compute TMEM encoding info");
-
-    if (encodingInfoOr->unpacked)
-      return emitOpError(
-          "tmem_load reduction requires packed format (unpacked=false)");
-
-    // Verify that N dimension is in registers entirely, and is not sharded
-    // across threads. This could be relaxed in the future to only reduce the
-    // kReg bases along N then cross-warp/block reduction becomes needed.
-    auto kReg = StringAttr::get(regTy.getContext(), "register");
-    int dimM = 0, dimN = 1;
-    auto regDims = toLinearEncoding(regTy).basesPerDim(kReg);
-    if (regDims[dimN] != toLinearLayout(regTy).getOutDimSizes().begin()[dimN] ||
-        regDims[dimM] != 1) {
-      return emitOpError("tmem_load reduction with N dimension sharded across "
-                         "threads is not supported.");
-    }
+    if (!supportsTMemLoadReduce(getType(), getSrc().getType(), maxnreg,
+                                [&]() { return emitOpError(); }))
+      return failure();
   }
 
   return triton::gpu::verifyMemoryOpTypes(*this, getSrc().getType(), getType());
@@ -1266,10 +1564,6 @@ LogicalResult TMEMCopyOp::verify() {
   auto srcTy = cast<triton::gpu::MemDescType>(getSrc().getType());
   auto dstTy = cast<triton::gpu::MemDescType>(getDst().getType());
 
-  if (getBarrier() && !isa<triton::gpu::SharedMemorySpaceAttr>(
-                          getBarrier().getType().getMemorySpace())) {
-    return emitOpError("The optional barrier should be a shared memory buffer");
-  }
   if (!getDst().getType().getMutableMemory()) {
     return emitOpError("Cannot copy into an immutable alloc");
   }
@@ -1744,11 +2038,25 @@ static LogicalResult verifyCLCResultMemdesc(Location loc, MemDescType desc) {
                              "single dimension equal to 2, but got "
                           << desc.getShape() << ".";
   }
+  auto cgaLayout = getCGALayout(layout);
+  auto kBlock = StringAttr::get(cgaLayout.getContext(), "block");
+  if (!llvm::all_of(cgaLayout.getLinearLayout().getBases().lookup(kBlock),
+                    [](const auto &basis) {
+                      return llvm::all_of(basis,
+                                          [](auto base) { return base == 0; });
+                    }))
+    return emitError(loc) << "Expected CLC result buffer cga_layout bases to "
+                             "be all zeros. Got "
+                          << formatCGALayout(cgaLayout);
   return success();
 }
 
 LogicalResult CLCTryCancelOp::verify() {
-  return verifyCLCResultMemdesc(getLoc(), getResult().getType());
+  if (failed(verifyCLCResultMemdesc(getLoc(), getResult().getType())))
+    return failure();
+  if (failed(verifyBarrierType(*this, getMbarrier().getType())))
+    return failure();
+  return verifyCompletionBarrierLayout(getOperation(), getMbarrier());
 }
 
 LogicalResult CLCLoadResultOp::verify() {

@@ -16,8 +16,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Tools/Sys/Dump.hpp"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/Dump.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 //===----------------------------------------------------------------------===//
 // This file will create a schedule that will be handed over to the pipeline
@@ -189,6 +189,9 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+    if (moduleOp->hasAttr(kSkipGenericPipelineAttrName))
+      return;
+
     // Transform the loop by introducing async operations to prepare it for
     // pipeline expansion.
     lowerLoops(moduleOp);

@@ -18,6 +18,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -31,7 +32,7 @@ namespace gpu {
 namespace {
 
 static bool isUnsupportedMMAv5Int8Dot(int computeCapability, DotOp op) {
-  if (computeCapability != 103)
+  if (nvidia_gpu::TargetFeatures(computeCapability).supportsI8Tcgen05MMA())
     return false;
   auto aElemTy = op.getA().getType().getElementType();
   auto bElemTy = op.getB().getType().getElementType();
@@ -88,7 +89,7 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
   auto rank = shape.size();
   // Early exit for batched matmul
   if (rank == 3)
-    return {(unsigned)numWarps, 1, 1};
+    return getMmaV2WarpsPerCTA(shape, numWarps);
 
   auto filter = [&dotOp](Operation *op) {
     return op->getParentRegion() == dotOp->getParentRegion() &&
@@ -117,33 +118,7 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
     }
   }
 
-  assert(rank == 2);
-  SmallVector<int64_t> shapePerWarp = {16, 8};
-  SmallVector<int64_t> warps = {1, 1};
-  // Compute repM and repN
-  SmallVector<int64_t> reps = {ceil(shape[0], shapePerWarp[0]),
-                               ceil(shape[1], shapePerWarp[1])};
-  // The formula for the number of registers given the reps is
-  // repM * 4 * repK + repN * 2 * repK + regsC
-  // where regsC = repM * repN * 4, which does not depend on the warp shape
-  //
-  // As such, to minimize the register pressure, we need to balance
-  // repM and repN. We then untie towards M, as the lhs tile has 4 elements,
-  // and the rhs tile has just 2.
-  while (product(warps) < numWarps) {
-    if (reps[0] >= reps[1]) {
-      warps[0] *= 2;
-      // Too many warps for this mma (repM == repN == 1).
-      // We allocate the remaining warps to the left (arbitrary choice)
-      if (reps[0] != 1) {
-        reps[0] /= 2;
-      }
-    } else {
-      warps[1] *= 2;
-      reps[1] /= 2;
-    }
-  }
-  return {(unsigned)warps[0], (unsigned)warps[1]};
+  return getMmaV2WarpsPerCTA(shape, numWarps);
 }
 SmallVector<unsigned, 2>
 warpsPerTileV3(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
@@ -264,8 +239,8 @@ getWarpsPerTile(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
 static bool bwdFilter(Operation *op) {
   return (op->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(op)) ||
          isView(op) ||
-         isa<Fp4ToFpOp, LoadOp, DescriptorLoadOp, BroadcastOp, ConvertLayoutOp>(
-             op);
+         isa<Fp4ToFpOp, LoadOp, DescriptorLoadLikeOpInterface, BroadcastOp,
+             ConvertLayoutOp>(op);
 }
 
 // Finds the bitwidth with which the value x is loaded
@@ -284,7 +259,7 @@ static int computeOrigBitWidth(Value x) {
 
   int origBitWidth = getElementTypeOrSelf(x).getIntOrFloatBitWidth();
   for (auto op : slice) {
-    if (isa<LoadOp, DescriptorLoadOp>(op)) {
+    if (isa<LoadOp, DescriptorLoadLikeOpInterface>(op)) {
       if (auto tensorTy =
               dyn_cast<RankedTensorType>(op->getResultTypes().front())) {
         origBitWidth =
@@ -401,12 +376,13 @@ public:
     auto oldBType = cast<RankedTensorType>(b.getType());
     auto oldRetType = cast<RankedTensorType>(dotOp.getType());
 
-    // Enable F64 MMA only on SM80/SM90 with high performance F64 tensorcore.
+    // Enable F64 MMA only on targets with high performance F64 tensor cores.
     // Otherwise, fallback to F64 FMA for better performance.
     if ((oldAType.getElementType().isF64() ||
          oldBType.getElementType().isF64() ||
          oldRetType.getElementType().isF64()) &&
-        !(computeCapability == 80 || computeCapability == 90)) {
+        !(computeCapability == 80 || computeCapability == 90 ||
+          (computeCapability >= 100 && computeCapability < 120))) {
       return failure();
     }
 
@@ -478,8 +454,9 @@ static bool canUseTwoCTAs(triton::DotOp dotOp) {
   // Skip convert layouts.
   while (auto cvtOp = b.getDefiningOp<ConvertLayoutOp>())
     b = cvtOp.getSrc();
-  return llvm::isa_and_nonnull<triton::LoadOp, triton::DescriptorLoadOp,
-                               triton::DescriptorGatherOp>(b.getDefiningOp());
+  return llvm::isa_and_nonnull<triton::LoadOp,
+                               triton::DescriptorLoadLikeOpInterface>(
+      b.getDefiningOp());
 }
 
 static DistributedEncodingTrait
@@ -506,8 +483,7 @@ static Value splitBOperand(Value b, mlir::PatternRewriter &rewriter) {
   while (auto cvtOp = b.getDefiningOp<ConvertLayoutOp>())
     b = cvtOp.getSrc();
   auto loadOp = b.getDefiningOp();
-  assert((isa<triton::LoadOp, triton::DescriptorLoadOp,
-              triton::DescriptorGatherOp>(loadOp)) &&
+  assert((isa<triton::LoadOp, triton::DescriptorLoadLikeOpInterface>(loadOp)) &&
          "expected LoadOp");
   RankedTensorType bType = cast<RankedTensorType>(b.getType());
   auto currentLayout = cast<DistributedEncodingTrait>(bType.getEncoding());
@@ -658,7 +634,7 @@ Value addSmemStageToScaleLoad(Value scale, mlir::PatternRewriter &rewriter) {
   if (!op)
     return scale;
 
-  while (!isa<LoadOp, DescriptorLoadOp>(op)) {
+  while (!isa<LoadOp, DescriptorLoadLikeOpInterface>(op)) {
     if (auto reshape = dyn_cast<ReshapeOp>(op)) {
       op = reshape.getSrc().getDefiningOp();
       loadConsumer = reshape;
@@ -706,7 +682,7 @@ public:
   mlir::LogicalResult
   matchAndRewrite(triton::DotScaledOp dotOp,
                   mlir::PatternRewriter &rewriter) const override {
-    if (computeCapability != 120)
+    if (computeCapability / 10 != 12)
       return failure();
 
     auto numCTAs = lookupNumCTAs(rewriter);
@@ -843,10 +819,29 @@ public:
       else if (isBFP4)
         IsBMixedPrecFp4 = true;
     }
-    // If we use txgen05.mma.kind.mxf864 we need to padd the fp4 operands:
+
+    bool isFp4MMA = isAFP4 && isBFP4;
+    bool requiresFp4Padding =
+        nvidia_gpu::TargetFeatures(computeCapability).requiresFp4Padding();
+
+    // On Blackwell, if we use mixed-precision MMA we need to pad the fp4
+    // operand
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-packing-formats-mxf8f6f4-smem
-    bool isMMAv5Fp4PaddedLhs = IsAMixedPrecFp4 || !dotOp.getLhsKPack();
-    bool isMMAv5Fp4PaddedRhs = IsBMixedPrecFp4 || !dotOp.getRhsKPack();
+    // On Rubin, the fp4 operand must be packed in SMEM if MMA_K = 64 is used.
+    // However, MMA_K = 64 with MN-major fp4 is not supported. In this case,
+    // the fp4 operand must be padded and MMA_K = 32 must be used.
+    // MMA_K = 64 is also not supported when BLOCK_M = 64.
+    auto blockK = dotOp.getA().getType().getShape().back() * (isAFP4 ? 2 : 1);
+    auto blockM = dotOp.getA().getType().getShape()[0];
+    bool isMMAv5Fp4PaddedLhs =
+        (isFp4MMA && !dotOp.getLhsKPack()) || // fp4  x fp4 with M-major A
+        (IsAMixedPrecFp4 && (requiresFp4Padding || blockM == 64 ||
+                             blockK == 32 || !dotOp.getLhsKPack()));
+    bool isMMAv5Fp4PaddedRhs =
+        (isFp4MMA && !dotOp.getRhsKPack()) || // fp4  x fp4 with N-major B
+        (IsBMixedPrecFp4 &&
+         (requiresFp4Padding || blockK == 32 || !dotOp.getRhsKPack()));
+
     // For mixed-precision fp4 operands, set allowTranspose = false, to force
     // the packed axis, K, to be contiguous in SMEM
     a = getSharedMemoryMMAOperand(a, rewriter, 0,
@@ -887,16 +882,27 @@ public:
     RankedTensorType oldScaleAType = dotOp.getAScale().getType();
     RankedTensorType oldScaleBType = dotOp.getBScale().getType();
 
-    Attribute scaleEncoding =
-        triton::nvidia_gpu::TensorMemoryScalesEncodingAttr::get(context,
-                                                                CGALayout);
+    auto aScaleBlockRepOrder =
+        triton::nvidia_gpu::getTensorMemoryScalesBlockRepOrder(
+            dotOp, /*isA=*/true, dotOp.getAElemType(), dotOp.getBElemType(),
+            oldScaleAType.getElementType(), oldScaleBType.getElementType());
+    auto bScaleBlockRepOrder =
+        triton::nvidia_gpu::getTensorMemoryScalesBlockRepOrder(
+            dotOp, /*isA=*/false, dotOp.getAElemType(), dotOp.getBElemType(),
+            oldScaleAType.getElementType(), oldScaleBType.getElementType());
+    Attribute scaleAEncoding =
+        triton::nvidia_gpu::TensorMemoryScalesEncodingAttr::get(
+            context, CGALayout, aScaleBlockRepOrder);
+    Attribute scaleBEncoding =
+        triton::nvidia_gpu::TensorMemoryScalesEncodingAttr::get(
+            context, CGALayout, bScaleBlockRepOrder);
     MemDescType scaleAType = triton::gpu::MemDescType::get(
-        oldScaleAType.getShape(), oldScaleAType.getElementType(), scaleEncoding,
-        tensorMemorySpace,
+        oldScaleAType.getShape(), oldScaleAType.getElementType(),
+        scaleAEncoding, tensorMemorySpace,
         /*mutableMemory=*/false);
     MemDescType scaleBType = triton::gpu::MemDescType::get(
-        oldScaleBType.getShape(), oldScaleBType.getElementType(), scaleEncoding,
-        tensorMemorySpace,
+        oldScaleBType.getShape(), oldScaleBType.getElementType(),
+        scaleBEncoding, tensorMemorySpace,
         /*mutableMemory=*/false);
     Attribute scaleALayout =
         nvidia_gpu::getDefaultLayoutForTmemLdSt(scaleAType, numWarps);
@@ -957,7 +963,7 @@ static bool mmav2SupportsFp8Operands(int computeCapability) {
   // although PTX instructions for mma v2 w/ fp8 operands exist for sm90 and
   // sm100, they are emulated as fp16 upcasts + fp16 HMMA in SASS. sm120 has
   // hardware support for fp8 operands w/ mmav2.
-  return computeCapability == 89 || computeCapability == 120;
+  return computeCapability == 89 || computeCapability / 10 == 12;
 }
 
 // promote operands of dot op if the existing combination is not natively

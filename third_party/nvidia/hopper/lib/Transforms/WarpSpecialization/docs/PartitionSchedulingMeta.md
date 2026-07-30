@@ -8,9 +8,10 @@ pipeline — it determines which warp group each operation will execute on.
 
 ## Overview
 
-The pass walks all `scf.for` loops with the `tt.warp_specialize` attribute and
-assigns each operation inside the loop (and post-loop consumers) to a
-**partition**. Each partition maps to a warp group at runtime.
+The pass walks supported loop-like operations with the `tt.warp_specialize`
+attribute and assigns each operation inside the scheduled body (and post-loop
+consumers) to a **partition**. Each partition maps to a warp group at runtime.
+The supported forms are `scf.for` and ordered-subset-carry `scf.while`.
 
 ```
 Phase 1: Categorize operations         (OpCategorizer + collectMMABackwardSlices)
@@ -22,6 +23,26 @@ Phase 6: Schedule post-loop ops        (schedulePostLoopOps — epilogue routing
   ─── end of getInitialSchedule ───
 Post:    propagatePartitions + optimizeSchedule + splitDataPartitionedIfOps
 ```
+
+## Supported Loop Forms
+
+Partition scheduling uses `LoopLikeOpInterface` at its API boundary, but does
+not accept arbitrary loop-like operations. `scf.for` uses its body region and
+retains the existing induction-variable offset. `scf.while` uses its after
+region as the scheduled body and has no induction variable.
+
+An `scf.while` is schedulable when `scf.condition` forwards a direct, unique,
+non-empty, order-preserving subset of its before-region arguments. Forwarded values map
+from after-region arguments through the condition operands to their actual
+yield slots; non-forwarded values are condition-only state and do not re-enter
+the scheduled body. This supports CLC's `(valid, x)` carry, where only `x` is
+forwarded. Empty, reordered, duplicate, or computed forwarding is rejected by
+stripping loop-local warp-specialization metadata and leaving a plain while.
+
+The before region remains loop control rather than a PSM partition. Task-ID
+propagation marks the while, its condition computation, `scf.condition`, and
+`scf.yield` with the union of tasks after the single-partition PSM anchors have
+been converted to task IDs.
 
 ## Tuning Knobs
 
@@ -167,6 +188,20 @@ rescaling) are not stolen by the data partition categorizer.
    in separate computation partitions. Following the specific operand index
    (rather than the whole `scf.if`) keeps distinct data partitions separate
    for cases like flex attention.
+
+   A **second union-find edge** groups MMAs that write the **same accumulator
+   TMEM buffer**. Accumulator-chained MMAs (e.g. `dq += K0ᵀ·dS0` then
+   `dq += K1ᵀ·dS1` into one `dq` tile, or `acc = A@B; acc += C@D`) form a serial
+   reduction whose dependency flows through the accumulator memdesc/token, *not*
+   an SSA result operand — so the forward-user-set walk above stops at each MMA
+   and never sees it. Without this edge the chained dots would be counted as
+   independent groups and split across partitions, racing on the shared tile.
+   `getAccumulatorBuffer` resolves each MMA's accumulator to a canonical buffer
+   identity: it stops at the backing `TMEMAllocOp`; traces through
+   region/offset-preserving views only (`MemDescTransOp`, `MemDescReinterpretOp`);
+   treats an offset-selecting `MemDescIndexOp` as its **own** identity (so two
+   different-offset sub-tiles of one allocation are *not* collapsed); and bails
+   to `nullptr` (logged) on any unrecognized producer rather than guessing.
 3. **Builds `opToDpId` map** for ALL reachable ops:
    - **Inner-loop ops**: From backward slices, using normalized group IDs.
      Ops appearing in multiple groups get `SHARED_DPID` sentinel.
@@ -182,14 +217,35 @@ which auto-resolves the dpId when not explicitly provided.
 
 1. **Collect backward slices** for each MMA.
 2. **Identify shared ops** — ops appearing in multiple slices.
-3. **Union-find grouping** — MMAs whose forward user sets overlap another MMA's
-   backward slice are grouped together.
+3. **Union-find grouping** — MMAs are grouped by two edges: (a) forward user
+   sets that overlap another MMA's backward slice, and (b) writing the same
+   accumulator buffer (`getAccumulatorBuffer`, see above). Edge (b) keeps
+   accumulator-chained MMAs in one group even when no slice overlap exists.
 4. **Count groups with exclusive ops** — only groups with at least one
    non-shared, non-constant op count. This becomes `dataPartitionFactor`.
 
 For FA forward with `data_partition_factor=2`, this yields `dpFactor=2`.
 For FA backward, MMAs are data-dependent (QK feeds PV via the same accumulator),
 so all MMAs group together → `dpFactor=1`.
+
+### Accumulator-chain backstop
+
+After all partition assignments are finalized (post `propagatePartitions` +
+`optimizeSchedule`, before serialization), a verification walk guards against
+any assignment path — union-find above, preassignment, or flex — that splits a
+shared tensor-memory accumulator across partitions that cannot be co-located.
+Concurrent accumulating MMAs into one tile race and silently corrupt the
+reduction, so this is turned into a **hard compile error** rather than a latent
+accuracy bug.
+
+The check maintains, per accumulator buffer, the **running intersection** of the
+partition-id sets of every MMA that writes it, and errors the moment that
+intersection becomes empty (no single partition is common to the whole chain).
+This is correct for chains of 3+ writers: `{0,1},{0,2},{2,3}` is flagged (empty
+overall intersection) while `{0,1},{0,2},{0,3}` passes on common partition `0`.
+The diagnostic attaches a note pointing at the first MMA on the chain. The fix
+is to co-locate the chain in one partition (lower `data_partition_factor`) or to
+give each partition its own accumulator and reduce at the end.
 
 ## Phase 2: Partition Layout (`createPartitionLayout`)
 
@@ -371,7 +427,7 @@ Flash Attention) is consumed by ops in multiple partitions, the correct
 model is a 1-producer to N-consumer channel: one TMA load writes the buffer,
 all consumer partitions read from it. The downstream
 `separateLocalAllocWithSrc` assigns the `local_store` the source op's
-single task ID (the TMA load partition), and `createChannelPost` creates a
+single task ID (the TMA load partition), and `createAllocChannel` creates a
 proper 1-to-N channel. This avoids buffer duplication and the SMEM it costs
 (per-consumer copies pushed FA3 forward over H100's 228KB SMEM limit).
 

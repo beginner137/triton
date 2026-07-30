@@ -23,6 +23,30 @@ struct TDMDescriptor {
   SmallVector<Value> getAllGroups() const;
 };
 
+SmallVector<Value> unpackTDMDescriptor(RewriterBase &rewriter, Location loc,
+                                       Value descStruct);
+SmallVector<Value> scalarizeTDMDescriptor(RewriterBase &rewriter, Location loc,
+                                          ArrayRef<Value> vectors);
+
+// Updates TDM descriptor fields in place.
+// Mirrors the parameter semantics of `amdg.update_tensor_descriptor`.
+//
+// - addOffsets (incremental): bumps global_addr by
+//   sum(addOffsets[i]*stride[i]) scaled by element size.  Empty = skip.
+// - setBounds  (rewrite):     overwrites tensor_dim absolutely.  Empty = skip.
+// - dest       (rewrite):     overwrites lds_addr.  Null = skip.
+// - pred       (rewrite):     overwrites pred.  Null = skip.
+// - barrier    (rewrite):     enables barrier signaling and writes barrier
+//                             addr.  Null = skip.
+//
+// Currently 2D-only; 3D-5D support TBD.
+void updateTensorDescriptor(RewriterBase &rewriter, Location loc,
+                            Type elementType, ArrayRef<int64_t> blockShape,
+                            Value &group0, Value &group1,
+                            ArrayRef<Value> addOffsets,
+                            ArrayRef<Value> setBounds, Value dest, Value pred,
+                            Value barrier);
+
 // Create a TDM descriptor. This creates a partially filled descriptor, with
 // shared memory address and pred set to zero. User of the descriptor is
 // expected to fill these fields later.
@@ -71,7 +95,7 @@ void fillTDMDescriptorForGatherScatter(
     SmallVector<Value> &group2, SmallVector<Value> &group3, Value ldsRowOffset,
     Value globalColOffset, Value ldsPtr, Value pred, Value barrierPtr,
     const triton::LinearLayout &cgaLayout, Value ctaId,
-    ArrayRef<Value> rowIndices, bool use32BitIndices);
+    ArrayRef<Value> rowIndices, bool use32BitIndices, bool isGather);
 
 // Emit a TDM load or store for regular (non-scatter) contiguous transfers.
 //
@@ -94,7 +118,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       Value pred, Value multicastMask, Type elementType,
                       Value barrierPtr, bool isLoad,
                       const triton::LinearLayout &sharedLayout,
-                      Attribute encoding, Value ctaId, bool isRowMajor);
+                      Attribute encoding, Value ctaId, bool isRowMajor,
+                      int32_t auxBits);
 
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.
 // For PartitionedSharedEncodingAttr, computes a partition-aligned warp
@@ -119,9 +144,11 @@ size_t getTDMGatherScatterInstrinsicCount(size_t numIndices,
 // scatter)
 // - rowIndices: which global rows to read from (gather) or write to (scatter)
 // - colOffset: starting column offset in global memory
-// - use32BitIndices: true for 32-bit indices (max 8 rows/instr), false for
-//   16-bit (max 16 rows/instr)
 // - isGather: true for gather (global->LDS), false for scatter (LDS->global)
+// - numWarps: number of warps in the CTA (used for warp predication)
+// - indicesType: the RankedTensorType of the index tensor. Used to derive
+//   whether indices are 32-bit or 16-bit, detect redundant warps (via
+//   getFreeVariableMasks), and compute per-warp LDS offsets.
 // Multiple TDM instructions are issued automatically if more rows are needed.
 void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
                           const LLVMTypeConverter *typeConverter,
@@ -131,7 +158,8 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
                           Value barrierPtr,
                           const triton::LinearLayout &cgaLayout, Value ctaId,
                           ArrayRef<Value> rowIndices, Value colOffset,
-                          bool use32BitIndices, bool isGather);
+                          bool isGather, int numWarps,
+                          RankedTensorType indicesType);
 
 // Emit prefetches for a TDM tile to make it available for an actual load in
 // the future. Data is prefetched cooperatively across all CTAs, warps, and

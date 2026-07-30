@@ -53,6 +53,12 @@ void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
                 isVolatile);
 }
 
+Value LoadOp::getPredicateOperand() { return getMask(); }
+
+void LoadOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
+
+Type LoadOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
 // load(ptr, splat(1), ...)        -> load(ptr, ...)
 // load(ptr, splat(0), other, ...) -> other
 struct CanonicalizeMaskedLoadPattern : public OpRewritePattern<LoadOp> {
@@ -103,6 +109,12 @@ void StoreOp::build(OpBuilder &builder, OperationState &state, Value ptr,
   return StoreOp::build(builder, state, ptr, value, /*mask=*/{}, cache, evict);
 }
 
+Value StoreOp::getPredicateOperand() { return getMask(); }
+
+void StoreOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
+
+Type StoreOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
 // store(ptr, value, splat(1), ...) -> store(ptr, value, ...)
 // store(ptr, value, splat(0), ...) -> [none]
 struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
@@ -135,6 +147,14 @@ struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
     return success();
   }
 };
+
+Value AtomicRMWOp::getPredicateOperand() { return getMask(); }
+
+void AtomicRMWOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+
+Type AtomicRMWOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
 
 void StoreOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                           MLIRContext *context) {
@@ -263,13 +283,6 @@ LogicalResult DotOp::verify() {
                                                      bEncoding);
 }
 
-bool DotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
   auto aShape = this->getA().getType().getShape();
@@ -352,27 +365,27 @@ LogicalResult DotScaledOp::verify() {
   return success();
 }
 
-LogicalResult DotScaledOp::deduceScaleFactor(
-    Value lhs, Value lhsScale, ScaleDotElemType lhsFormat, bool lhsKPack,
-    Value rhs, Value rhsScale, ScaleDotElemType rhsFormat, bool rhsKPack,
-    int32_t &scaleFactor, std::string &errMsg) {
-  auto deduceByShape = [&errMsg](Value operand, Value scale, int opIdx,
-                                 ScaleDotElemType format,
+LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
+                                std::optional<ArrayRef<int64_t>> lhsScaleShape,
+                                ScaleDotElemType lhsFormat, bool lhsKPack,
+                                ArrayRef<int64_t> rhsShape,
+                                std::optional<ArrayRef<int64_t>> rhsScaleShape,
+                                ScaleDotElemType rhsFormat, bool rhsKPack,
+                                int32_t &scaleFactor, std::string &errMsg) {
+  auto deduceByShape = [&errMsg](ArrayRef<int64_t> operandShape,
+                                 std::optional<ArrayRef<int64_t>> scaleShape,
+                                 int opIdx, ScaleDotElemType format,
                                  bool kPack) -> int32_t {
-    if (!scale)
+    if (!scaleShape)
       return 0;
-    auto scaleTy = cast<RankedTensorType>(scale.getType());
-    if (scaleTy.getNumElements() == 1)
+    if (llvm::product_of(*scaleShape) == 1)
       return 0;
-
-    auto operandShape = cast<RankedTensorType>(operand.getType()).getShape();
-    auto scaleShape = scaleTy.getShape();
 
     int64_t unpackFactor = (format == ScaleDotElemType::E2M1 && kPack) ? 2 : 1;
     int64_t kdim = operandShape[opIdx == 0 ? operandShape.size() - 1
                                            : operandShape.size() - 2] *
                    unpackFactor;
-    int32_t scaleFactor = kdim / scaleShape[scaleShape.size() - 1];
+    int32_t scaleFactor = kdim / (*scaleShape)[scaleShape->size() - 1];
     if (scaleFactor != 16 && scaleFactor != 32) {
       std::ostringstream oss;
       oss << "scale factor must be 16 or 32. Got " << scaleFactor;
@@ -383,10 +396,12 @@ LogicalResult DotScaledOp::deduceScaleFactor(
   };
 
   errMsg.clear();
-  int32_t scaleFactorA = deduceByShape(lhs, lhsScale, 0, lhsFormat, lhsKPack);
+  int32_t scaleFactorA =
+      deduceByShape(lhsShape, lhsScaleShape, 0, lhsFormat, lhsKPack);
   if (!errMsg.empty())
     return failure();
-  int32_t scaleFactorB = deduceByShape(rhs, rhsScale, 1, rhsFormat, rhsKPack);
+  int32_t scaleFactorB =
+      deduceByShape(rhsShape, rhsScaleShape, 1, rhsFormat, rhsKPack);
   if (!errMsg.empty())
     return failure();
 
@@ -407,6 +422,26 @@ LogicalResult DotScaledOp::deduceScaleFactor(
   }
   scaleFactor = scaleFactorA != 0 ? scaleFactorA : scaleFactorB;
   return success();
+}
+
+LogicalResult DotScaledOp::deduceScaleFactor(
+    Value lhs, Value lhsScale, ScaleDotElemType lhsFormat, bool lhsKPack,
+    Value rhs, Value rhsScale, ScaleDotElemType rhsFormat, bool rhsKPack,
+    int32_t &scaleFactor, std::string &errMsg) {
+  auto getScaleShape = [](Value scale) -> std::optional<ArrayRef<int64_t>> {
+    if (!scale) {
+      return std::nullopt;
+    } else {
+      return cast<RankedTensorType>(scale.getType()).getShape();
+    }
+  };
+
+  auto lhsShape = cast<RankedTensorType>(lhs.getType()).getShape();
+  auto rhsShape = cast<RankedTensorType>(rhs.getType()).getShape();
+
+  return triton::deduceScaleFactor(lhsShape, getScaleShape(lhsScale), lhsFormat,
+                                   lhsKPack, rhsShape, getScaleShape(rhsScale),
+                                   rhsFormat, rhsKPack, scaleFactor, errMsg);
 }
 
 int32_t DotScaledOp::deduceScaleFactor() {
@@ -630,8 +665,6 @@ bool ReduceOp::hasDefinedOrdering() {
   return attr && attr.getValue() != "unordered";
 }
 
-unsigned ReduceOp::getNumOperands() { return this->getOperands().size(); }
-
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
                    ValueRange operands, int axis, bool reverse) {
@@ -664,8 +697,6 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
 }
-
-unsigned ScanOp::getNumOperands() { return this->getOperands().size(); }
 
 //-- MapElementwiseOp
 LogicalResult MapElementwiseOp::verify() {
@@ -847,6 +878,31 @@ OpFoldResult ExpandDimsOp::fold(FoldAdaptor adaptor) {
   return foldViewLikeOp(*this, adaptor.getSrc());
 }
 
+//-- CatOp --
+LogicalResult CatOp::verify() {
+  RankedTensorType lhsTy = getLhs().getType();
+  RankedTensorType resultTy = getType();
+
+  int64_t operandElements = lhsTy.getNumElements() * 2;
+  if (resultTy.getNumElements() != operandElements) {
+    return emitOpError("result element count must equal the sum of the "
+                       "operand element counts, expected ")
+           << operandElements << " but got " << resultTy.getNumElements();
+  }
+
+  Attribute operandEnc = lhsTy.getEncoding();
+  Attribute resultEnc = resultTy.getEncoding();
+  if (!!operandEnc != !!resultEnc) {
+    return emitOpError("requires that either (a) operands and result all have "
+                       "encodings, or (b) none do.");
+  }
+  if (!resultEnc)
+    return success();
+
+  auto interface = cast<DialectInferLayoutInterface>(&resultEnc.getDialect());
+  return interface->verifyCatOpEncodingCompatibility(getOperation());
+}
+
 //-- ReshapeOp --
 
 void ReshapeOp::build(OpBuilder &builder, OperationState &state,
@@ -855,9 +911,10 @@ void ReshapeOp::build(OpBuilder &builder, OperationState &state,
   auto srcEnc = srcTy.getEncoding();
   Attribute dstEnc;
   if (srcEnc) {
-    auto result = cast<DialectInferLayoutInterface>(&srcEnc.getDialect())
-                      ->inferReshapeOpEncoding(srcTy.getShape(), srcEnc, shape,
-                                               dstEnc, state.location);
+    auto result =
+        cast<DialectInferLayoutInterface>(&srcEnc.getDialect())
+            ->inferReshapeOpEncoding(srcTy.getShape(), srcEnc, shape, dstEnc,
+                                     allowReorder, state.location);
     assert(succeeded(result));
   }
   auto dstTy = RankedTensorType::get(shape, srcTy.getElementType(), dstEnc);
@@ -912,22 +969,33 @@ LogicalResult ReshapeOp::verify() {
 
   Attribute srcEnc = srcTy.getEncoding();
   Attribute dstEnc = dstTy.getEncoding();
+  // If either side carries a TLX placeholder wrapper (#tlx.user_layout /
+  // #tlx.no_verify_layout) -- at the top or nested inside a ttg encoding (e.g.
+  // a slice/expand parent) -- defer all reshape layout verification to
+  // resolve-placeholder-layouts (make_ttgir); the concrete src/dst may not be
+  // consistent yet at this point.
+  if (encodingContainsTlxPlaceholder(srcEnc) ||
+      encodingContainsTlxPlaceholder(dstEnc))
+    return success();
   if (!!srcEnc != !!dstEnc) {
     return emitError("Op requires that either (a) src and dst both have "
                      "encodings, or (b) neither does.");
   }
 
-  if (!srcEnc || getAllowReorder()) {
+  if (!srcEnc) {
     return success();
   }
 
-  // Check that we can infer the dst encoding from the src encoding
-  // and that the inferred dst encoding is the same as the given dst encoding
-  Attribute inferredDstEnc;
+  // Check that we can infer the dst encoding from the src encoding and that the
+  // inferred dst encoding is the same as the given dst encoding. We pass the
+  // current dst encoding as a hint so that allowReorder reshapes are guaranteed
+  // to produce the current encoding iff it is valid.
+  Attribute inferredDstEnc = dstEnc;
   auto layoutInterface =
       cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
   auto result = layoutInterface->inferReshapeOpEncoding(
-      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc, getLoc());
+      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc,
+      getAllowReorder(), getLoc());
   if (failed(result))
     return failure();
   return layoutInterface->verifyLayoutsAreEqual(
@@ -1099,6 +1167,12 @@ LogicalResult FpToFpOp::verify() {
 }
 
 //-- BitcastOp --
+OpFoldResult BitcastOp::fold(FoldAdaptor adaptor) {
+  if (getSrc().getType() == getType())
+    return getSrc();
+  return {};
+}
+
 LogicalResult BitcastOp::verify() {
   // Bitcast only allows conversion between types with the same bit width.
   Type dstType = getType();
@@ -1193,9 +1267,7 @@ void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
   }
   auto elemTy = ptrTy.getPointeeType();
   SmallVector<int64_t> blockShape64(blockShape);
-  auto blockTy = RankedTensorType::get(blockShape64, elemTy);
-  auto descTy =
-      TensorDescType::get(builder.getContext(), blockTy, isSignedInteger);
+  auto descTy = TensorDescType::get(blockShape64, elemTy, isSignedInteger);
   auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
   return build(builder, state, descTy, base, shape, strides,
                /*descPtr=*/Value(), paddingAttr);
@@ -1212,9 +1284,7 @@ void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
   }
   auto elemTy = ptrTy.getPointeeType();
   SmallVector<int64_t> blockShape64(blockShape);
-  auto blockTy = RankedTensorType::get(blockShape64, elemTy);
-  auto descTy =
-      TensorDescType::get(builder.getContext(), blockTy, isSignedInteger);
+  auto descTy = TensorDescType::get(blockShape64, elemTy, isSignedInteger);
   auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
   return build(builder, state, descTy, base, shape, strides, descPtr,
                paddingAttr);
@@ -1344,6 +1414,112 @@ void MakeTensorDescOp::getEffects(
     effects.emplace_back(MemoryEffects::Write::get(), GlobalMemory::get());
   }
   // Otherwise, the operation is pure (no effects)
+}
+
+//-- IntToPtrOp --
+// Pattern 1: int_to_ptr(ptr_to_int(ptr)) -> ptr
+// Eliminates round-trip pointer conversions
+struct CanonicalizeIntToPtrOfPtrToInt : public OpRewritePattern<IntToPtrOp> {
+  CanonicalizeIntToPtrOfPtrToInt(MLIRContext *context)
+      : OpRewritePattern<IntToPtrOp>(context, 1) {}
+
+  LogicalResult matchAndRewrite(IntToPtrOp intToPtrOp,
+                                PatternRewriter &rewriter) const override {
+    // Match: int_to_ptr(ptr_to_int(ptr))
+    auto ptrToIntOp = intToPtrOp.getSrc().getDefiningOp<PtrToIntOp>();
+    if (!ptrToIntOp)
+      return failure();
+    rewriter.replaceOpWithNewOp<BitcastOp>(intToPtrOp, intToPtrOp.getType(),
+                                           ptrToIntOp.getSrc());
+    return success();
+  }
+};
+
+// Pattern 2: int_to_ptr(addi(val, constant_offset)) -> addptr(int_to_ptr(val),
+// element_offset). Only when offset is constant and divisible by element size
+struct CanonicalizeIntToPtrWithAdd : public OpRewritePattern<IntToPtrOp> {
+  CanonicalizeIntToPtrWithAdd(MLIRContext *context)
+      : OpRewritePattern<IntToPtrOp>(context, 1) {}
+
+  LogicalResult matchAndRewrite(IntToPtrOp intToPtrOp,
+                                PatternRewriter &rewriter) const override {
+    // Match: int_to_ptr(addi(val, constant_offset))
+    auto addOp = intToPtrOp.getSrc().getDefiningOp<arith::AddIOp>();
+    if (!addOp)
+      return failure();
+
+    Value intValue = addOp.getLhs();
+    Value offsetValue = addOp.getRhs();
+
+    // Get the element size from the result pointer type
+    auto resultType = intToPtrOp.getType();
+    auto ptrType = cast<PointerType>(getElementTypeOrSelf(resultType));
+    int64_t elemSizeBits = triton::getPointeeBitWidth(ptrType);
+    int64_t elemSizeBytes = std::max<int64_t>(1, elemSizeBits / 8);
+
+    // Check if offset is a constant (either directly or via splat)
+    // Only apply canonicalization for constant offsets
+    std::optional<int64_t> constantByteOffset;
+    if (auto constOp = offsetValue.getDefiningOp<arith::ConstantOp>()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+        constantByteOffset = intAttr.getValue().getSExtValue();
+      } else if (auto splatAttr =
+                     dyn_cast<SplatElementsAttr>(constOp.getValue())) {
+        constantByteOffset =
+            splatAttr.getSplatValue<IntegerAttr>().getValue().getSExtValue();
+      }
+    }
+
+    if (!constantByteOffset.has_value())
+      return failure(); // Only handle constant offsets
+
+    // Check if the byte offset is divisible by element size
+    if (constantByteOffset.value() % elemSizeBytes != 0)
+      return failure();
+
+    // Compute element offset at compile time
+    int64_t elementOffset = constantByteOffset.value() / elemSizeBytes;
+
+    // Create int_to_ptr(val) for the base
+    auto loc = intToPtrOp.getLoc();
+    Value basePtr = IntToPtrOp::create(rewriter, loc, resultType, intValue);
+
+    // Create the element offset constant
+    Value elementOffsetValue;
+
+    // Get the integer type from the offset value to match its type
+    Type offsetElemType;
+    if (auto tensorType = dyn_cast<RankedTensorType>(offsetValue.getType())) {
+      offsetElemType = tensorType.getElementType();
+    } else {
+      offsetElemType = offsetValue.getType();
+    }
+
+    if (auto tensorType = dyn_cast<RankedTensorType>(resultType)) {
+      // Create a splat constant for tensor types, matching the offset's type
+      auto offsetAttr = rewriter.getIntegerAttr(offsetElemType, elementOffset);
+      auto splatType = RankedTensorType::get(
+          tensorType.getShape(), offsetElemType, tensorType.getEncoding());
+      auto splatAttr = SplatElementsAttr::get(splatType, offsetAttr);
+      elementOffsetValue = arith::ConstantOp::create(rewriter, loc, splatAttr);
+    } else {
+      // Scalar case
+      elementOffsetValue = arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(offsetElemType, elementOffset));
+    }
+
+    // Replace with addptr(int_to_ptr(val), element_offset)
+    rewriter.replaceOpWithNewOp<AddPtrOp>(intToPtrOp, resultType, basePtr,
+                                          elementOffsetValue);
+    return success();
+  }
+};
+
+void IntToPtrOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                             MLIRContext *context) {
+  results.add<CanonicalizeIntToPtrOfPtrToInt, CanonicalizeIntToPtrWithAdd>(
+      context);
 }
 
 // The following ops, including `call`, `func`, and `return` are copied and
@@ -1665,7 +1841,7 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
 LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
                                     ShapedType resultType,
                                     ShapedType indicesType) {
-  // Gather from `!tt.tensordesc<tensor<1xMxdtype>>`.
+  // Gather from `!tt.tensordesc<1xMxdtype>`.
   if (blockType.getRank() != 2) {
     return op->emitOpError("descriptor block must be a 2D tensor, but got ")
            << blockType;

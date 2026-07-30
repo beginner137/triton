@@ -5,10 +5,12 @@ add_triton_library(TritonGPUTransforms
   FuseNestedLoops.cpp
   CombineTensorSelectAndIf.cpp
   DecomposeScaledBlocked.cpp
+  DescriptorMemoryLayouts.cpp
   HoistTMEMAlloc.cpp
   ReduceDataDuplication.cpp
   OptimizeAccumulatorInit.cpp
   OptimizeDotOperands.cpp
+  OptimizeReductionLayout.cpp
   OptimizeThreadLocality.cpp
   Pipeliner/AssignLatencies.cpp
   Pipeliner/LowerLoops.cpp

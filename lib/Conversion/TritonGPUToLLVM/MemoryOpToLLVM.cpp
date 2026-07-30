@@ -6,6 +6,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
 
 namespace {
 
@@ -13,106 +14,46 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+static std::pair<LinearLayout, LinearLayout>
+getPhysicalLayouts(LinearLayout regLayout, MemDescType memDescTy) {
+  auto sharedLayout = toLinearLayout(memDescTy);
+  if (!regLayout.isModular())
+    return {std::move(regLayout), std::move(sharedLayout)};
+
+  auto allocShape = getAllocationShapePerCTA(memDescTy);
+  sharedLayout = toLinearLayout(allocShape, memDescTy.getEncoding());
+  SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+  for (auto dim : regLayout.getOutDimNames())
+    paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
+  regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
+                           /*requireSurjective=*/false);
+  return {std::move(regLayout), std::move(sharedLayout)};
+}
+
 // Helper for LocalGather/ScatterOpConversion.
 // For gather: storeVals is empty, returns loaded values.
 // For scatter: storeVals contains values to store, returns empty.
-SmallVector<Value> lowerLocalScGt(Location loc, MLIRContext *ctx,
-                                  MemDescType memDescTy,
-                                  SharedMemoryObject smemObj, Type llvmElemTy,
-                                  ArrayRef<Value> idxValues,
-                                  ArrayRef<SmallVector<Value>> coords,
-                                  unsigned axis, ArrayRef<Value> storeVals,
-                                  RewriterBase &rewriter) {
+SmallVector<Value>
+lowerLocalScGt(Location loc, MLIRContext *ctx, MemDescType memDescTy,
+               SharedMemoryObject smemObj, Type llvmElemTy,
+               ArrayRef<Value> idxValues, ArrayRef<SmallVector<Value>> coords,
+               unsigned axis, ArrayRef<Value> storeVals, RewriterBase &rewriter,
+               const TargetInfoBase &targetInfo) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   bool isScatter = !storeVals.empty();
-
-  // Get the shared memory layout (linear component for padded layouts)
-  auto sharedLayout = isPaddedEncoding(memDescTy.getEncoding())
-                          ? paddedLinearLayout(memDescTy)
-                          : toLinearLayout(memDescTy);
-  LinearLayout invSharedLayout = sharedLayout.invert();
-
-  // Get layout dimension names for all dims
-  SmallVector<StringAttr> allDims;
-  for (unsigned dim = 0, rank = memDescTy.getRank(); dim < rank; ++dim) {
-    allDims.push_back(str_attr("dim" + Twine(dim)));
-  }
-
-  auto kOffset = str_attr("offset");
-
-  // Get the subslice affine offset (non-zero for memdesc subslices)
-  Value affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
-  auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+  SmallVector<Value> ptrs = computeLocalPtrs(
+      loc, memDescTy, smemObj, llvmElemTy, idxValues, coords, axis, rewriter);
 
   SmallVector<Value> results;
-  if (!isScatter) {
+  if (!isScatter)
     results.resize(coords.size());
-  }
 
-  for (auto [i, idxVal] : llvm::enumerate(idxValues)) {
-    // Convert index to i32 if needed
-    Value idx = idxVal;
-    unsigned idxWidth = idx.getType().getIntOrFloatBitWidth();
-    if (idxWidth > 32) {
-      idx = b.trunc(i32_ty, idx);
-    } else if (idxWidth < 32) {
-      idx = b.zext(i32_ty, idx);
-    }
-
-    // Copy coordinates and replace the axis coordinate with the index value
-    SmallVector<Value> indices(coords[i]);
-    indices[axis] = idx;
-
-    // Apply inverted shared layout to compute offset
-    SmallVector<std::pair<StringAttr, Value>> inputs;
-    for (unsigned dim = 0; dim < indices.size(); ++dim) {
-      inputs.push_back({allDims[dim], indices[dim]});
-    }
-
-    auto outputs = applyLinearLayout(loc, rewriter, invSharedLayout, inputs);
-
-    // Extract the offset value
-    Value offset = nullptr;
-    for (auto [name, value] : outputs) {
-      if (name == kOffset) {
-        offset = value;
-        break;
-      }
-    }
-    assert(offset && "expected offset output from inverted shared layout");
-
-    // For subslices, the physical offset is computed as:
-    //   physical_offset = L⁻¹(coords) ⊕ L⁻¹(subslice_logical_offset)
-    //
-    // We use XOR for consistency with lowerLdSt. MemDescSubsliceOp::verify()
-    // enforces:
-    // 1. Subslice offsets must be multiples of the tile size
-    // 2. Subslice offsets must map to power-of-2 physical offsets
-    //
-    // These constraints ensure the bit ranges of L⁻¹(coords) and
-    // L⁻¹(subslice_offset) are disjoint, so XOR and addition are equivalent.
-    offset = b.xor_(offset, affineOffset);
-
-    // Add padding offset for padded layouts (non-linear component)
-    Value ptr;
-    if (isPaddedEncoding(memDescTy.getEncoding())) {
-      // Convert offset to bytes for padding calculation
-      Value offsetBytes = b.mul(offset, b.i32_val(bitwidth / 8));
-      auto shifts = getPaddedSharedShifts(memDescTy.getEncoding(), bitwidth,
-                                          /*offsetInBytes=*/true);
-      // GEP in bytes: base + offset*elemSize + padOffset
-      Value totalOffset = applyPadding(loc, rewriter, offsetBytes, shifts);
-      ptr = b.gep(smemObj.getBase().getType(), i8_ty, smemObj.getBase(),
-                  totalOffset);
-    } else {
-      ptr = b.gep(smemObj.getBase().getType(), llvmElemTy, smemObj.getBase(),
-                  offset);
-    }
-
+  for (auto [i, ptr] : llvm::enumerate(ptrs)) {
     if (isScatter) {
-      b.store(storeVals[i], ptr);
+      targetInfo.storeShared(rewriter, loc, ptr, storeVals[i], b.true_val());
     } else {
-      results[i] = b.load(llvmElemTy, ptr);
+      results[i] =
+          targetInfo.loadShared(rewriter, loc, ptr, llvmElemTy, b.true_val());
     }
   }
 
@@ -139,13 +80,10 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
   if (isPaddedEncoding(memDescTy.getEncoding())) {
     cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
   } else {
-    auto sharedLayout = toLinearLayout(memDescTy);
+    auto [physicalRegLayout, sharedLayout] =
+        getPhysicalLayouts(regLayout, memDescTy);
+    regLayout = std::move(physicalRegLayout);
     cvt = regLayout.invertAndCompose(sharedLayout);
-  }
-  auto kBlock = str_attr("block");
-  // NYI. We would need to emit a map.shared::cluster instruction.
-  if (!cvt.isTrivialOver({kBlock})) {
-    return failure();
   }
   // Keep the "partition" output dim (PartitionedSharedEncoding) so lowerLdSt
   // can select the per-partition base pointer; lowerLdSt strips it afterwards.
@@ -285,11 +223,13 @@ public:
     if (isPaddedEncoding(memDescTy.getEncoding())) {
       cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
     } else {
-      auto sharedLayout = toLinearLayout(memDescTy);
+      auto [physicalRegLayout, sharedLayout] =
+          getPhysicalLayouts(regLayout, memDescTy);
+      regLayout = std::move(physicalRegLayout);
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");
-    // NYI. We would need to emit a map.shared::cluster instruction.
+    // We could support it by removing this check if we ever want to
     if (!cvt.isTrivialOver({kBlock})) {
       return failure();
     }
@@ -448,7 +388,7 @@ public:
 
     auto results = lowerLocalScGt(loc, ctx, memDescTy, smemObj, llvmElemTy,
                                   idxValues, dstIndices, op.getAxis(),
-                                  /*storeVals=*/{}, rewriter);
+                                  /*storeVals=*/{}, rewriter, targetInfo);
 
     Value result = packLLElements(loc, typeConverter, results, rewriter, regTy);
     rewriter.replaceOp(op, result);
@@ -549,7 +489,7 @@ public:
                     /*withCTAOffset=*/true);
 
     lowerLocalScGt(loc, ctx, memDescTy, smemObj, llvmElemTy, idxValues,
-                   srcIndices, op.getAxis(), values, rewriter);
+                   srcIndices, op.getAxis(), values, rewriter, targetInfo);
 
     rewriter.eraseOp(op);
     return success();

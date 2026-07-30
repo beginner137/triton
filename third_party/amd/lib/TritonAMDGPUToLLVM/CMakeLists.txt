@@ -4,6 +4,8 @@ add_triton_library(TritonAMDGPUToLLVM
     AllocateSharedMemory.cpp
     BarrierOpConversion.cpp
     BufferOpsEmitter.cpp
+    OffsetUniformitySplit.cpp
+    UniformityAnalysis.cpp
     TensorPtrOpsToLLVM.cpp
     ConvertLayoutOpToLLVM.cpp
     ConvertWarpPipeline.cpp
@@ -32,6 +34,7 @@ add_triton_library(TritonAMDGPUToLLVM
     TDMUtility.cpp
     BarrierOpToLLVM.cpp
     WarpIdOpToLLVM.cpp
+    ConvertFpCastOpToLLVM.cpp
 
     DEPENDS
     TritonAMDGPUConversionPassIncGen
@@ -41,6 +44,7 @@ add_triton_library(TritonAMDGPUToLLVM
     MLIRReconcileUnrealizedCasts
     TritonGPUToLLVM
     TritonAMDGPUIR
+    TritonAMDAnalysis
     LLVMCore
     LLVMPasses
     LLVMSupport

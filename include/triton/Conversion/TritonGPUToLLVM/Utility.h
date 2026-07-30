@@ -14,6 +14,9 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <optional>
 
 #define DEBUG_TYPE "ttgpu_to_llvm"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -331,7 +334,7 @@ namespace triton {
 namespace gpu {
 
 std::pair<SmallVector<LocalMemOpTile>, SmallVector<LocalMemOpTile>>
-getSrcDstTiles(const TargetInfoBase &targetInfo, int bitwidth);
+getSrcDstTiles(const TargetInfoBase &targetInfo, int bitwidth, bool crossCTA);
 
 Type getFunctionType(Type resultType, ValueRange operands);
 
@@ -453,6 +456,11 @@ SharedMemoryObject getSharedMemoryObjectFromStruct(Location loc,
                                                    Value llvmStruct,
                                                    Type elemTy,
                                                    RewriterBase &rewriter);
+
+// Build a vector of shared-memory base pointers for dynamic partition
+// indexing (expects at least two bases).
+Value buildBasePtrVector(Location loc, RewriterBase &rewriter,
+                         ArrayRef<Value> smemBases);
 
 // Convert an \param index to a multi-dim coordinate given \param shape and
 // \param order.
@@ -593,6 +601,38 @@ SmallVector<SmallVector<Value>>
 emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
             Attribute layout, RankedTensorType type, bool withCTAOffset);
 
+SmallVector<SmallVector<Value>>
+emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
+            const LinearLayout &layout, RankedTensorType type,
+            bool withCTAOffset);
+
+// Compute per-element shared-memory pointers for a local atomic/ldst update by
+// replacing `coords[*][axis]` with `idxValues[*]` and mapping the resulting
+// logical coordinates back to shared-memory offsets.
+SmallVector<Value> computeLocalPtrs(Location loc,
+                                    triton::gpu::MemDescType memDescTy,
+                                    SharedMemoryObject smemObj, Type llvmElemTy,
+                                    ArrayRef<Value> idxValues,
+                                    ArrayRef<SmallVector<Value>> coords,
+                                    unsigned axis, RewriterBase &rewriter);
+
+// Backend-agnostic preparation for lowering LocalAtomicScatterRMWOp.
+struct LocalAtomicScatterRMWInfo {
+  RankedTensorType valuesTy;
+  Type llvmElemTy;
+  LinearLayout regLayout;
+  ColumnAction removeBroadcast;
+  Value threadPred;
+  SmallVector<Value> values;
+  SmallVector<Value> maskValues;
+  SmallVector<Value> ptrs;
+};
+
+FailureOr<LocalAtomicScatterRMWInfo> prepareLocalAtomicScatterRMW(
+    triton::gpu::LocalAtomicScatterRMWOp op, Value dst, Value indices,
+    Value inputValues, Value mask, ConversionPatternRewriter &rewriter,
+    const TargetInfoBase &targetInfo, const LLVMTypeConverter *typeConverter);
+
 // Calculates the required interval chunking and padding logical-shift values
 // for shared memory padding, depending on elements' bit width and whether
 // offsets count the number of bytes or number of elements.
@@ -627,18 +667,19 @@ SmallVector<Value> lowerLdStShared(
 // calcPaddedOffset is a lambda that takes a base offset (mlir::Value)
 // and computes a new offset (mlir::Value) by applying padding based on
 // shared memory layout.
-SmallVector<Value> lowerLdSt(
-    Location loc, MLIRContext *ctx, LinearLayout cvt,
-    ArrayRef<Value> valsArray, // Input for store, output for load
-    Type llvmElemTy, ArrayRef<Value> smemBases,
-    ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, Value laneId, Value warpId,
-    RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-    std::optional<int> maybeMaxVecElems,
-    std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
-                                     Value, int, VectorType)>
-        lowerInst,
-    std::optional<Value> barrierPtr = {});
+SmallVector<Value>
+lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
+          ArrayRef<Value> valsArray, // Input for store, output for load
+          Type llvmElemTy, ArrayRef<Value> smemBases,
+          ArrayRef<std::pair<unsigned, unsigned>> paddingShifts,
+          Value affineOffset, uint64_t maskSpanAffineOffset, Value laneId,
+          Value warpId, RewriterBase &rewriter,
+          const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems,
+          std::function<SmallVector<Value>(RewriterBase &, Location,
+                                           ArrayRef<Value>, Value, int,
+                                           VectorType, std::optional<Value>)>
+              lowerInst,
+          std::optional<Value> barrierPtr = {});
 
 // Lower local_load/local_store via ld.shared/st.shared
 SmallVector<Value> lowerLocalLdSt(
@@ -669,6 +710,30 @@ llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx);
 
 llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type);
 
+/// Clamp vec size for NPOT dims: round down to a pow2 load/store width, then
+/// clamp to the alignment of a non-pow2 sizePerThread (Blocked only; Slice/
+/// Linear don't reach here). No-op for pow2, so safe to run unconditionally
+/// (not flag-gated).
+inline unsigned clampVecSizeForNpot(unsigned vec, RankedTensorType tensorTy) {
+  if (vec <= 1)
+    return vec; // avoids Log2_32(0) UB
+  if (!llvm::isPowerOf2_32(vec))
+    vec = 1u << llvm::Log2_32(vec);
+  if (!tensorTy)
+    return vec;
+  if (auto blocked =
+          dyn_cast<triton::gpu::BlockedEncodingAttr>(tensorTy.getEncoding())) {
+    auto contOrder = triton::gpu::getOrder(tensorTy);
+    unsigned spt = blocked.getSizePerThread()[contOrder[0]];
+    if (spt > 0 && !llvm::isPowerOf2_32(spt)) {
+      // Largest pow2 divisor (lowest set bit) = the guaranteed alignment.
+      unsigned maxAligned = spt & (0u - spt);
+      vec = std::min(vec, maxAligned);
+    }
+  }
+  return vec;
+}
+
 inline bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return (index & freeVarMask) == 0;
 }
@@ -680,10 +745,10 @@ void makeAllWarpGroupsIsolatedFromAbove(Operation *op);
 // Set the correct loop annotation on LLVM branch ops.
 void fixUpLoopAnnotation(ModuleOp mod);
 
-void transferWithinBlockSwizzling(triton::gpu::ConvertLayoutOp op, Value src,
-                                  const TargetInfoBase &targetInfo,
-                                  const LLVMTypeConverter *typeConverter,
-                                  RewriterBase &rewriter);
+void transferSwizzlingLocalMem(triton::gpu::ConvertLayoutOp op, Value src,
+                               const TargetInfoBase &targetInfo,
+                               const LLVMTypeConverter *typeConverter,
+                               RewriterBase &rewriter);
 
 SmallVector<Value> inlineRegionImpl(RewriterBase &rewriter, Region &region,
                                     ArrayRef<Value> args,

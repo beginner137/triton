@@ -162,7 +162,9 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         // This packs a few rows together for small K
         int perPhase = std::max<int>(1024 / (bitwidth * K), 1);
 
-        int mmaStride = 8;
+        // FP64 MMAv2 uses an m8n8k4 tile rather than the m16n8 tile used by
+        // the other MMAv2 variants.
+        int mmaStride = bitwidth == 64 ? 4 : 8;
         int vec = 4 * kWidth;
         // needsTrans is equiv. to flipping the opIdx
         if (needTrans)
@@ -816,15 +818,27 @@ for
       unsigned prevLanes = 1;
       unsigned prevWarps = 1;
 
+      // A non-power-of-2 dim (e.g. shapePerCTA[i]/sizePerThread[i] == 6) yields a
+      // non-pow2 lane/warp factor, so threadsPerWarp/warpsPerCTA no longer tile
+      // to the warp/CTA. Under TRITON_ALLOW_NPOT, floor each factor to a pow2 so
+      // the tile stays pow2 and the NPOT remainder is carried by the tensor shape
+      // (the modular LinearLayout). Flooring a pow2 is a no-op, so pow2 shapes
+      // are byte-identical.
+      static const bool allowNpot =
+          mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+      auto pow2Floor = [&](unsigned x) -> unsigned {
+        return allowNpot ? (1u << llvm::Log2_32(std::max<unsigned>(x, 1))) : x;
+      };
+
       // starting from the contiguous dimension
       for (unsigned d = 0; d < rank - 1; ++d) {
         unsigned i = order[d];
         unsigned threadsPerCTA = std::clamp<unsigned>(remainingThreads, 1, std::max<unsigned>(1, shapePerCTA[i] / sizePerThread[i]));
-        threadsPerWarp[i] = std::clamp<unsigned>(threadsPerCTA, 1, remainingLanes);
-        warpsPerCTA[i] = std::clamp<unsigned>(threadsPerCTA / threadsPerWarp[i], 1, remainingWarps);
+        threadsPerWarp[i] = pow2Floor(std::clamp<unsigned>(threadsPerCTA, 1, remainingLanes));
+        warpsPerCTA[i] = pow2Floor(std::clamp<unsigned>(threadsPerCTA / threadsPerWarp[i], 1, remainingWarps));
         remainingWarps /= warpsPerCTA[i];
         remainingLanes /= threadsPerWarp[i];
-        remainingThreads /= threadsPerCTA;
+        remainingThreads /= threadsPerWarp[i] * warpsPerCTA[i];
         prevLanes *= threadsPerWarp[i];
         prevWarps *= warpsPerCTA[i];
       }
@@ -1221,6 +1235,11 @@ This simplifies both WMMA and dotOperand layouts lowering to linear layout.
     static SmallVector<unsigned, 3> getDefaultInstrShape() {
       return {16, 16, 16};
     }
+
+    // Returns nonK dim of operand opIdx (swapped for asymmetric transposed WMMA).
+    unsigned getOperandNonKDim(unsigned opIdx) const;
+    static unsigned getOperandNonKDim(unsigned mDim, unsigned nDim,
+                                      bool isTransposed, unsigned opIdx);
 
     // Returns a swizzled shared layout matching this WMMA layout for the
     // dot operand at the given |operandIdx| with |operandShape|.
